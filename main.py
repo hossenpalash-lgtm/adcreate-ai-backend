@@ -266,6 +266,26 @@ class SelectContentPlanPostRequest(BaseModel):
     image_base64: Optional[str] = None
 
 
+class StockPhotoResult(BaseModel):
+    id: str
+    thumbnail_url: str
+    full_url: str
+    photographer: str
+
+
+class StockPhotoSearchResponse(BaseModel):
+    results: list[StockPhotoResult]
+
+
+class FetchStockPhotoRequest(BaseModel):
+    url: str
+
+
+class FetchStockPhotoResponse(BaseModel):
+    image_base64: str
+    mime_type: str
+
+
 # -----------------------
 # ENV / CLIENTS
 # -----------------------
@@ -276,6 +296,8 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 # startup requirement, since the rest of the app must keep working even
 # before/without this one being configured.
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+# Optional — only stock-photo search needs this, same reasoning as above.
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()
 
 if not OPENAI_API_KEY:
     raise Exception("Missing OPENAI_API_KEY")
@@ -1052,6 +1074,66 @@ def fetch_product_link(
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/ads/stock-photos", response_model=StockPhotoSearchResponse, tags=["ads"])
+@limiter.limit("20/minute")
+def search_stock_photos(request: Request, query: str, user_id: str = Depends(get_current_user_id)):
+    """Free — a search proxy to Pexels, no AI call. A photo source
+    option for users with no product photo of their own and who don't
+    want an AI-imagined one."""
+    if not PEXELS_API_KEY:
+        raise HTTPException(status_code=503, detail="Stock photo search isn't enabled yet.")
+    q = (query or "").strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="Type something to search for.")
+    try:
+        resp = with_retry(
+            lambda: requests.get(
+                "https://api.pexels.com/v1/search",
+                params={"query": q, "per_page": 15, "orientation": "square"},
+                headers={"Authorization": PEXELS_API_KEY},
+                timeout=10,
+            ),
+            exceptions=(requests.RequestException,),
+            attempts=2,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException:
+        raise HTTPException(status_code=502, detail="Couldn't reach the stock photo service.")
+    results = [
+        {
+            "id": str(p["id"]),
+            "thumbnail_url": p["src"]["medium"],
+            "full_url": p["src"]["large"],
+            "photographer": p.get("photographer", ""),
+        }
+        for p in data.get("photos", [])
+    ]
+    return {"results": results}
+
+
+@app.post("/ads/fetch-stock-photo", response_model=FetchStockPhotoResponse, tags=["ads"])
+@limiter.limit("20/minute")
+def fetch_stock_photo(request: Request, req: FetchStockPhotoRequest, user_id: str = Depends(get_current_user_id)):
+    """Free — fetches the actual image bytes for a photo the user picked
+    from search results. Restricted to Pexels' own CDN host (not an
+    arbitrary user-supplied URL like fetch-product-link) as defense in
+    depth on top of the existing SSRF guard in _fetch_url_bytes."""
+    url = (req.url or "").strip()
+    if urlparse(url).hostname != "images.pexels.com":
+        raise HTTPException(status_code=400, detail="That link isn't allowed.")
+    try:
+        image_bytes, content_type = _fetch_url_bytes(url)
+    except HTTPException:
+        raise
+    except requests.RequestException:
+        raise HTTPException(status_code=400, detail="Couldn't fetch that photo.")
+    return {
+        "image_base64": base64.b64encode(image_bytes).decode("ascii"),
+        "mime_type": content_type or "image/jpeg",
+    }
 
 
 # -----------------------
