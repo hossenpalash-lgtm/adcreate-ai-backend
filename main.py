@@ -22,6 +22,10 @@ import logging
 import base64
 import requests
 import sentry_sdk
+import ipaddress
+import socket
+from urllib.parse import urlparse
+from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
 
 # -----------------------
@@ -169,6 +173,17 @@ class TranslateCaptionsRequest(BaseModel):
 
 class TranslateCaptionsResponse(BaseModel):
     captions: list[AdCaptionVariant]
+
+
+class FetchProductLinkRequest(BaseModel):
+    url: str
+
+
+class FetchProductLinkResponse(BaseModel):
+    title: str
+    description: str
+    image_base64: Optional[str] = None
+    mime_type: Optional[str] = None
 
 
 BUSINESS_CATEGORIES = {
@@ -537,6 +552,90 @@ Respond with ONLY this JSON format, nothing else, same number of items in the sa
     ]
 
 
+_MAX_LINK_FETCH_BYTES = 3_000_000  # generous for a product page/photo, small enough to bound abuse
+
+
+def _assert_public_url(url: str) -> None:
+    """SSRF guard — this endpoint fetches a URL the user typed in, so
+    without this check a request could be pointed at internal services
+    or a cloud metadata endpoint (e.g. 169.254.169.254) that Render's
+    network can reach but the public internet can't. Best-effort, not
+    exhaustive: resolves once and checks the IP is globally routable,
+    doesn't defend against DNS-rebinding between this check and the
+    actual request — acceptable for this app's current scale/threat
+    model, not a substitute for a proper egress proxy if that changes."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(status_code=400, detail="Please enter a valid product page link.")
+    hostname = parsed.hostname
+    if not hostname:
+        raise HTTPException(status_code=400, detail="Please enter a valid product page link.")
+    try:
+        resolved_ip = socket.gethostbyname(hostname)
+    except socket.gaierror:
+        raise HTTPException(status_code=400, detail="Couldn't resolve that link.")
+    if not ipaddress.ip_address(resolved_ip).is_global:
+        raise HTTPException(status_code=400, detail="That link isn't allowed.")
+
+
+def _fetch_url_bytes(url: str) -> tuple[bytes, str]:
+    _assert_public_url(url)
+    resp = with_retry(
+        lambda: requests.get(
+            url,
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; AdCreateAI/1.0)"},
+            stream=True,
+        ),
+        exceptions=(requests.RequestException,),
+        attempts=2,
+    )
+    resp.raise_for_status()
+    content = resp.raw.read(_MAX_LINK_FETCH_BYTES + 1, decode_content=True)
+    if len(content) > _MAX_LINK_FETCH_BYTES:
+        raise HTTPException(status_code=400, detail="That page is too large to fetch.")
+    return content, resp.headers.get("Content-Type", "")
+
+
+def _fetch_product_from_link(url: str) -> dict:
+    """Free — no AI call, just an HTTP fetch + Open Graph tag parse.
+    Works generically across Shopify, WooCommerce, and most storefronts
+    without needing a platform-specific integration, since og:title/
+    og:description/og:image are the same convention everywhere."""
+    html_bytes, _ = _fetch_url_bytes(url)
+    soup = BeautifulSoup(html_bytes, "html.parser")
+
+    def meta(*names: str) -> Optional[str]:
+        for name in names:
+            tag = soup.find("meta", attrs={"property": name}) or soup.find("meta", attrs={"name": name})
+            if tag and tag.get("content"):
+                return tag["content"].strip()
+        return None
+
+    title = meta("og:title", "twitter:title")
+    if not title and soup.title and soup.title.string:
+        title = soup.title.string.strip()
+    description = meta("og:description", "twitter:description", "description") or ""
+    image_url = meta("og:image", "twitter:image")
+
+    image_base64 = None
+    mime_type = None
+    if image_url:
+        try:
+            image_bytes, content_type = _fetch_url_bytes(image_url)
+            image_base64 = base64.b64encode(image_bytes).decode("ascii")
+            mime_type = content_type or "image/jpeg"
+        except (HTTPException, requests.RequestException):
+            pass  # title/description alone are still useful without a photo
+
+    return {
+        "title": title or "",
+        "description": description,
+        "image_base64": image_base64,
+        "mime_type": mime_type,
+    }
+
+
 def _generate_banner_image(image_bytes: bytes, mime_type: str, item_description: str) -> bytes:
     """Edits the user's own photo (background only) via Gemini —
     deliberately does NOT ask the model to add any text to the image. Text
@@ -850,6 +949,33 @@ def translate_captions(
         return {"captions": translated}
     except HTTPException:
         raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/fetch-product-link", response_model=FetchProductLinkResponse, tags=["ads"])
+@limiter.limit("10/minute")
+def fetch_product_link(
+    request: Request,
+    req: FetchProductLinkRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Free — a plain HTTP fetch + HTML parse, no AI call. Lets an
+    e-commerce seller paste their product page link instead of typing a
+    description and uploading a photo from scratch."""
+    try:
+        url = (req.url or "").strip()
+        if not url:
+            raise HTTPException(status_code=400, detail="Paste a product page link.")
+        result = _fetch_product_from_link(url)
+        if not result["title"] and not result["description"]:
+            raise HTTPException(status_code=422, detail="Couldn't find product info at that link.")
+        return result
+    except HTTPException:
+        raise
+    except requests.RequestException:
+        raise HTTPException(status_code=400, detail="Couldn't reach that link.")
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
