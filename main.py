@@ -196,16 +196,43 @@ BUSINESS_CATEGORIES = {
 
 class BusinessProfileOut(BaseModel):
     category: str
+    brand_color: Optional[str] = None
+    logo_base64: Optional[str] = None
+    logo_mime_type: Optional[str] = None
 
 
 class SetBusinessProfileRequest(BaseModel):
-    category: str
+    # All optional — this is a partial update. Omitted fields keep
+    # whatever's already saved rather than being cleared to null, so the
+    # Brand Kit panel (color+logo) and the Weekly Plan category picker
+    # can each save independently without clobbering the other.
+    category: Optional[str] = None
+    brand_color: Optional[str] = None
+    logo_base64: Optional[str] = None
+    logo_mime_type: Optional[str] = None
 
     @field_validator("category")
     @classmethod
     def validate_category(cls, v):
-        if v not in BUSINESS_CATEGORIES:
+        if v is not None and v not in BUSINESS_CATEGORIES:
             raise ValueError(f"category must be one of {sorted(BUSINESS_CATEGORIES)}")
+        return v
+
+    @field_validator("brand_color")
+    @classmethod
+    def validate_brand_color(cls, v):
+        if v is not None and not re.fullmatch(r"#[0-9A-Fa-f]{6}", v):
+            raise ValueError("brand_color must be a hex color like #3B5BFF")
+        return v
+
+    @field_validator("logo_base64")
+    @classmethod
+    def validate_logo_size(cls, v):
+        # ~2MB decoded (base64 is ~4/3 the size of the raw bytes) — a
+        # logo has no business being bigger than this, and it's stored
+        # as a plain text column rather than object storage.
+        if v is not None and len(v) > 2_800_000:
+            raise ValueError("Logo image is too large (max ~2MB).")
         return v
 
 
@@ -422,10 +449,51 @@ def _set_business_category(user_id: str, category: str) -> None:
     }, on_conflict="owner_id").execute())
 
 
+def _get_business_profile(user_id: str) -> dict:
+    res = with_retry(lambda: supabase.table("business_profile")
+        .select("category, brand_color, logo_base64, logo_mime_type")
+        .eq("owner_id", user_id)
+        .execute())
+    res = ensure_supabase_response(res, "get business profile")
+    if res.data:
+        row = res.data[0]
+        return {
+            "category": row.get("category") or "other",
+            "brand_color": row.get("brand_color"),
+            "logo_base64": row.get("logo_base64"),
+            "logo_mime_type": row.get("logo_mime_type"),
+        }
+    return {"category": "other", "brand_color": None, "logo_base64": None, "logo_mime_type": None}
+
+
+def _update_business_profile(
+    user_id: str,
+    category: Optional[str] = None,
+    brand_color: Optional[str] = None,
+    logo_base64: Optional[str] = None,
+    logo_mime_type: Optional[str] = None,
+) -> dict:
+    """Fetch-then-merge partial update — each field is only overwritten
+    if the caller actually provided it, so the Brand Kit panel (color +
+    logo) and the Weekly Plan category picker don't stomp on each
+    other's fields when saving independently."""
+    current = _get_business_profile(user_id)
+    payload = {
+        "owner_id": user_id,
+        "category": category if category is not None else current["category"],
+        "brand_color": brand_color if brand_color is not None else current["brand_color"],
+        "logo_base64": logo_base64 if logo_base64 is not None else current["logo_base64"],
+        "logo_mime_type": logo_mime_type if logo_mime_type is not None else current["logo_mime_type"],
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with_retry(lambda: supabase.table("business_profile").upsert(payload, on_conflict="owner_id").execute())
+    return {k: payload[k] for k in ("category", "brand_color", "logo_base64", "logo_mime_type")}
+
+
 @app.get("/business-profile", response_model=BusinessProfileOut, tags=["ads"])
 def get_business_profile(user_id: str = Depends(get_current_user_id)):
     try:
-        return {"category": _get_business_category(user_id)}
+        return _get_business_profile(user_id)
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -434,8 +502,13 @@ def get_business_profile(user_id: str = Depends(get_current_user_id)):
 @app.post("/business-profile", response_model=BusinessProfileOut, tags=["ads"])
 def set_business_profile(req: SetBusinessProfileRequest, user_id: str = Depends(get_current_user_id)):
     try:
-        _set_business_category(user_id, req.category)
-        return {"category": req.category}
+        return _update_business_profile(
+            user_id,
+            category=req.category,
+            brand_color=req.brand_color,
+            logo_base64=req.logo_base64,
+            logo_mime_type=req.logo_mime_type,
+        )
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
