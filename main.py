@@ -286,6 +286,27 @@ class FetchStockPhotoResponse(BaseModel):
     mime_type: str
 
 
+class GeneratedPostOut(BaseModel):
+    id: str
+    item_description: str
+    facebook_caption: str
+    whatsapp_message: str
+    image_base64: str
+    created_at: str
+
+
+class GeneratedPostHistoryResponse(BaseModel):
+    posts: list[GeneratedPostOut]
+
+
+class SuggestHashtagsRequest(BaseModel):
+    item_description: str
+
+
+class SuggestHashtagsResponse(BaseModel):
+    hashtags: list[str]
+
+
 # -----------------------
 # ENV / CLIENTS
 # -----------------------
@@ -444,6 +465,69 @@ def _spend_ad_credit(user_id: str) -> int:
 def ad_credits(user_id: str = Depends(get_current_user_id)):
     try:
         return {"credits": _get_ad_credits(user_id)}
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -----------------------
+# CONTENT LIBRARY (generation history)
+# -----------------------
+GENERATED_POSTS_RETENTION = 20
+
+
+def _save_generated_post(user_id: str, item_description: str, caption: dict, image_base64: str) -> None:
+    """Best-effort — a save failure shouldn't break the actual generation
+    the user is waiting on, so this never raises. Retention capped
+    per-user (unlike Brand Kit's one-row-per-user, this table grows
+    unbounded with usage) so it can't quietly fill up the database over
+    a user's lifetime."""
+    try:
+        with_retry(lambda: supabase.table("generated_posts").insert({
+            "owner_id": user_id,
+            "item_description": item_description,
+            "facebook_caption": caption.get("facebook_caption", ""),
+            "whatsapp_message": caption.get("whatsapp_message", ""),
+            "image_base64": image_base64,
+        }).execute())
+        existing = with_retry(lambda: supabase.table("generated_posts")
+            .select("id")
+            .eq("owner_id", user_id)
+            .order("created_at", desc=True)
+            .execute())
+        existing = ensure_supabase_response(existing, "list generated posts for retention")
+        stale_ids = [row["id"] for row in existing.data[GENERATED_POSTS_RETENTION:]]
+        if stale_ids:
+            supabase.table("generated_posts").delete().in_("id", stale_ids).execute()
+    except Exception as e:
+        logger.error("Failed to save generated post to history: %s", str(e), exc_info=True)
+
+
+@app.get("/ads/history", response_model=GeneratedPostHistoryResponse, tags=["ads"])
+def get_history(user_id: str = Depends(get_current_user_id)):
+    try:
+        res = with_retry(lambda: supabase.table("generated_posts")
+            .select("id, item_description, facebook_caption, whatsapp_message, image_base64, created_at")
+            .eq("owner_id", user_id)
+            .order("created_at", desc=True)
+            .limit(GENERATED_POSTS_RETENTION)
+            .execute())
+        res = ensure_supabase_response(res, "get generated post history")
+        return {"posts": res.data}
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/ads/history/{post_id}", tags=["ads"])
+def delete_history_post(post_id: str, user_id: str = Depends(get_current_user_id)):
+    try:
+        # Filtering by owner_id too (not just id) is the actual access
+        # check here — this backend talks to Supabase with a service-role
+        # key, so nothing stops a request for someone else's row at the
+        # DB layer without this.
+        supabase.table("generated_posts").delete().eq("id", post_id).eq("owner_id", user_id).execute()
+        return {"deleted": True}
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -610,6 +694,41 @@ Respond with ONLY this JSON format, nothing else:
     ] or [{"facebook_caption": "", "whatsapp_message": ""}]
 
 
+def _suggest_hashtags(item_description: str, category: str) -> list[str]:
+    """Free — text-only, same economics as translate-captions. Separate
+    from _generate_ad_copy's caption text on purpose: Predis's own
+    tutorial has a dedicated hashtag-picker step distinct from the
+    caption, letting the user toggle individual tags rather than getting
+    them locked into whatever the AI wrote inline."""
+    category_guidance = CONTENT_PLAN_CATEGORY_GUIDANCE.get(category, CONTENT_PLAN_CATEGORY_GUIDANCE["other"])
+    prompt = f"""Suggest 12 relevant hashtags for a small business Facebook/Instagram post. Mix a few broad/popular tags with several niche/specific ones. Don't include the # symbol, no spaces within a tag.
+
+{category_guidance}
+
+The post is about: {item_description}
+
+Respond with ONLY this JSON format, nothing else:
+{{"hashtags": ["tag1", "tag2"]}}
+"""
+    response = with_retry(
+        lambda: client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You suggest relevant social media hashtags for small business marketing."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.7,
+        ),
+        exceptions=RETRYABLE_OPENAI_ERRORS,
+    )
+    ai_text = response.choices[0].message.content.strip()
+    m = re.search(r"```(?:json)?\n(.*?)```", ai_text, re.S)
+    ai_text_clean = m.group(1).strip() if m else ai_text.strip().strip("`").strip()
+    parsed = json.loads(ai_text_clean)
+    tags = parsed.get("hashtags") or []
+    return [str(t).lstrip("#").strip() for t in tags if str(t).strip()][:15]
+
+
 def _translate_captions(captions: list[dict], target_language: str) -> list[dict]:
     """Text-only, reuses the already-generated captions instead of
     regenerating from scratch — cheap enough (gpt-4o-mini, small prompt)
@@ -731,7 +850,32 @@ def _fetch_product_from_link(url: str) -> dict:
     }
 
 
-def _generate_banner_image(image_bytes: bytes, mime_type: str, item_description: str) -> bytes:
+# Requesting the shape natively (rather than always generating square and
+# cropping/letterboxing afterward client-side) avoids the photo's actual
+# subject ever getting cropped into by the story/feed export. The
+# client-side export in image-export.ts stays as a fallback path (e.g.
+# for images generated before this existed, or if Gemini doesn't follow
+# the hint exactly), since compositeImage.ts already adapts to whatever
+# dimensions it's actually given.
+ASPECT_RATIO_PROMPTS = {
+    "square": "Output a high-quality square (1:1) image.",
+    "feed": "Output a high-quality image in a 4:5 vertical portrait aspect ratio (taller than it is wide) — a standard Facebook/Instagram feed post shape.",
+    "story": "Output a high-quality image in a 9:16 vertical portrait aspect ratio (tall and narrow) — a standard Instagram/Facebook Story shape.",
+}
+
+# The prompt-text hint above is not reliable on its own — tested and
+# confirmed Gemini ignores it and returns a square image regardless. The
+# actual mechanism is this SDK-level config (supported aspect ratios per
+# https://ai.google.dev/gemini-api/docs/image-generation: 1:1, 2:3, 3:2,
+# 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9).
+ASPECT_RATIO_GEMINI_VALUES = {
+    "square": "1:1",
+    "feed": "4:5",
+    "story": "9:16",
+}
+
+
+def _generate_banner_image(image_bytes: bytes, mime_type: str, item_description: str, aspect_ratio: str = "square") -> bytes:
     """Edits the user's own photo (background only) via Gemini —
     deliberately does NOT ask the model to add any text to the image. Text
     rendered by image models is unreliable/garbled; the caller overlays
@@ -739,6 +883,7 @@ def _generate_banner_image(image_bytes: bytes, mime_type: str, item_description:
     if gemini_client is None:
         raise HTTPException(status_code=503, detail="AI image generation isn't enabled yet.")
 
+    shape_instruction = ASPECT_RATIO_PROMPTS.get(aspect_ratio, ASPECT_RATIO_PROMPTS["square"])
     prompt = (
         "Edit this product photo into a clean, professional promotional banner "
         "background suitable for a Facebook ad for a small business. "
@@ -748,7 +893,7 @@ def _generate_banner_image(image_bytes: bytes, mime_type: str, item_description:
         f"fitting for this item/offer: {item_description}. "
         "Do NOT add any text, letters, numbers, or words anywhere in the image — "
         "leave clean, uncluttered space (e.g. near the top or bottom) where text "
-        "will be added afterward by a separate step. Output a high-quality square image."
+        f"will be added afterward by a separate step. {shape_instruction}"
     )
     response = with_retry(
         lambda: gemini_client.models.generate_content(
@@ -757,6 +902,11 @@ def _generate_banner_image(image_bytes: bytes, mime_type: str, item_description:
                 genai_types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
                 prompt,
             ],
+            config=genai_types.GenerateContentConfig(
+                image_config=genai_types.ImageConfig(
+                    aspect_ratio=ASPECT_RATIO_GEMINI_VALUES.get(aspect_ratio, "1:1"),
+                ),
+            ),
         ),
         exceptions=(Exception,),
         attempts=2,
@@ -767,7 +917,7 @@ def _generate_banner_image(image_bytes: bytes, mime_type: str, item_description:
     raise Exception("Gemini did not return an image")
 
 
-def _generate_ai_banner_image(item_description: str, category: str = "other") -> bytes:
+def _generate_ai_banner_image(item_description: str, category: str = "other", aspect_ratio: str = "square") -> bytes:
     """Generates a banner image from scratch (no real photo) for users
     without one to upload. The pictured product is AI-imagined rather than
     the business's actual item, so this only ever runs when the frontend
@@ -776,6 +926,7 @@ def _generate_ai_banner_image(item_description: str, category: str = "other") ->
         raise HTTPException(status_code=503, detail="AI image generation isn't enabled yet.")
 
     category_guidance = CONTENT_PLAN_CATEGORY_GUIDANCE.get(category, CONTENT_PLAN_CATEGORY_GUIDANCE["other"])
+    shape_instruction = ASPECT_RATIO_PROMPTS.get(aspect_ratio, ASPECT_RATIO_PROMPTS["square"])
     prompt = (
         "Generate a clean, professional, photorealistic promotional banner image "
         "for a Facebook ad for a small business. "
@@ -784,12 +935,17 @@ def _generate_ai_banner_image(item_description: str, category: str = "other") ->
         "Make it well-lit, visually appealing, and contextually appropriate. "
         "Do NOT add any text, letters, numbers, or words anywhere in the image — "
         "leave clean, uncluttered space (e.g. near the top or bottom) where text "
-        "will be added afterward by a separate step. Output a high-quality square image."
+        f"will be added afterward by a separate step. {shape_instruction}"
     )
     response = with_retry(
         lambda: gemini_client.models.generate_content(
             model="gemini-2.5-flash-image",
             contents=[prompt],
+            config=genai_types.GenerateContentConfig(
+                image_config=genai_types.ImageConfig(
+                    aspect_ratio=ASPECT_RATIO_GEMINI_VALUES.get(aspect_ratio, "1:1"),
+                ),
+            ),
         ),
         exceptions=(Exception,),
         attempts=2,
@@ -800,7 +956,13 @@ def _generate_ai_banner_image(item_description: str, category: str = "other") ->
     raise Exception("Gemini did not return an image")
 
 
-async def _get_banner_image(image_bytes: Optional[bytes], mime_type: Optional[str], item_description: str, category: str) -> bytes:
+async def _get_banner_image(
+    image_bytes: Optional[bytes],
+    mime_type: Optional[str],
+    item_description: str,
+    category: str,
+    aspect_ratio: str = "square",
+) -> bytes:
     # Gemini image generation is a blocking call and can take well over a
     # minute (especially generating from scratch, no reference photo) — run
     # it off the event loop so a slow generation doesn't stall every other
@@ -808,8 +970,8 @@ async def _get_banner_image(image_bytes: Optional[bytes], mime_type: Optional[st
     # a real bug: without run_in_threadpool, one slow generation freezes
     # the whole backend for every user until it finishes.)
     if image_bytes:
-        return await run_in_threadpool(_generate_banner_image, image_bytes, mime_type or "image/jpeg", item_description)
-    return await run_in_threadpool(_generate_ai_banner_image, item_description, category)
+        return await run_in_threadpool(_generate_banner_image, image_bytes, mime_type or "image/jpeg", item_description, aspect_ratio)
+    return await run_in_threadpool(_generate_ai_banner_image, item_description, category, aspect_ratio)
 
 
 def _remove_background(image_bytes: bytes, mime_type: str) -> bytes:
@@ -880,10 +1042,13 @@ def _enhance_image(image_bytes: bytes, mime_type: str) -> bytes:
 async def generate_ad(
     request: Request,
     item_description: str,
+    aspect_ratio: str = "square",
     file: Optional[UploadFile] = File(None),
     user_id: str = Depends(get_current_user_id),
 ):
     try:
+        if aspect_ratio not in ASPECT_RATIO_PROMPTS:
+            aspect_ratio = "square"
         credits = _get_ad_credits(user_id)
         if credits <= 0:
             raise HTTPException(
@@ -896,13 +1061,15 @@ async def generate_ad(
         category = _get_business_category(user_id)
 
         copy = _generate_ad_copy(item_description, category)
-        banner_bytes = await _get_banner_image(image_bytes, mime_type, item_description, category)
+        banner_bytes = await _get_banner_image(image_bytes, mime_type, item_description, category, aspect_ratio)
 
         new_credits = _spend_ad_credit(user_id)
+        banner_b64 = base64.b64encode(banner_bytes).decode("ascii")
+        _save_generated_post(user_id, item_description, copy[0], banner_b64)
 
         return {
             "captions": copy,
-            "banner_image_base64": base64.b64encode(banner_bytes).decode("ascii"),
+            "banner_image_base64": banner_b64,
             "credits_remaining": new_credits,
         }
     except HTTPException:
@@ -917,6 +1084,7 @@ async def generate_ad(
 async def generate_ad_image_variant(
     request: Request,
     item_description: str,
+    aspect_ratio: str = "square",
     file: Optional[UploadFile] = File(None),
     user_id: str = Depends(get_current_user_id),
 ):
@@ -925,6 +1093,8 @@ async def generate_ad_image_variant(
     own credit since Gemini image generation is the expensive part of a
     generation, not the text."""
     try:
+        if aspect_ratio not in ASPECT_RATIO_PROMPTS:
+            aspect_ratio = "square"
         credits = _get_ad_credits(user_id)
         if credits <= 0:
             raise HTTPException(
@@ -935,7 +1105,7 @@ async def generate_ad_image_variant(
         image_bytes = await file.read() if file is not None else None
         mime_type = file.content_type if file is not None else None
         category = _get_business_category(user_id)
-        banner_bytes = await _get_banner_image(image_bytes, mime_type, item_description, category)
+        banner_bytes = await _get_banner_image(image_bytes, mime_type, item_description, category, aspect_ratio)
 
         new_credits = _spend_ad_credit(user_id)
 
@@ -1042,6 +1212,28 @@ def translate_captions(
             raise HTTPException(status_code=502, detail="Translation failed. Please try again.")
 
         return {"captions": translated}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/suggest-hashtags", response_model=SuggestHashtagsResponse, tags=["ads"])
+@limiter.limit("15/minute")
+def suggest_hashtags(
+    request: Request,
+    req: SuggestHashtagsRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Free — text-only GPT call, same economics as translate-captions."""
+    try:
+        text = (req.item_description or "").strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="Tell us what the post is about first.")
+        category = _get_business_category(user_id)
+        hashtags = _suggest_hashtags(text, category)
+        return {"hashtags": hashtags}
     except HTTPException:
         raise
     except Exception as e:
