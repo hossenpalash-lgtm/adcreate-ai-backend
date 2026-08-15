@@ -162,6 +162,15 @@ class AdImageVariantResponse(BaseModel):
     credits_remaining: int
 
 
+class TranslateCaptionsRequest(BaseModel):
+    captions: list[AdCaptionVariant]
+    target_language: str
+
+
+class TranslateCaptionsResponse(BaseModel):
+    captions: list[AdCaptionVariant]
+
+
 BUSINESS_CATEGORIES = {
     "retail", "restaurant_cafe", "health_beauty", "professional_services",
     "home_services", "real_estate", "automotive", "education_coaching",
@@ -491,6 +500,43 @@ Respond with ONLY this JSON format, nothing else:
     ] or [{"facebook_caption": "", "whatsapp_message": ""}]
 
 
+def _translate_captions(captions: list[dict], target_language: str) -> list[dict]:
+    """Text-only, reuses the already-generated captions instead of
+    regenerating from scratch — cheap enough (gpt-4o-mini, small prompt)
+    to bundle free rather than spend a credit on it."""
+    prompt = f"""Translate the following Facebook ad captions and WhatsApp messages into {target_language}. Keep the same tone and meaning, adapt naturally rather than translating word-for-word, and keep any numbers/prices exactly as given.
+
+Captions to translate:
+{json.dumps(captions)}
+
+Respond with ONLY this JSON format, nothing else, same number of items in the same order:
+{{"captions": [{{"facebook_caption": "", "whatsapp_message": ""}}]}}
+"""
+    response = with_retry(
+        lambda: client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a professional marketing translator."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.5,
+        ),
+        exceptions=RETRYABLE_OPENAI_ERRORS,
+    )
+    ai_text = response.choices[0].message.content.strip()
+    m = re.search(r"```(?:json)?\n(.*?)```", ai_text, re.S)
+    ai_text_clean = m.group(1).strip() if m else ai_text.strip().strip("`").strip()
+    parsed = json.loads(ai_text_clean)
+    translated = parsed.get("captions") or []
+    return [
+        {
+            "facebook_caption": c.get("facebook_caption", ""),
+            "whatsapp_message": c.get("whatsapp_message", ""),
+        }
+        for c in translated
+    ]
+
+
 def _generate_banner_image(image_bytes: bytes, mime_type: str, item_description: str) -> bytes:
     """Edits the user's own photo (background only) via Gemini —
     deliberately does NOT ask the model to add any text to the image. Text
@@ -572,6 +618,69 @@ async def _get_banner_image(image_bytes: Optional[bytes], mime_type: Optional[st
     return await run_in_threadpool(_generate_ai_banner_image, item_description, category)
 
 
+def _remove_background(image_bytes: bytes, mime_type: str) -> bytes:
+    """Swaps the photo's background for clean flat white, keeping the
+    product itself untouched — same edit-not-generate pattern as
+    _generate_banner_image, just a narrower prompt."""
+    if gemini_client is None:
+        raise HTTPException(status_code=503, detail="AI image generation isn't enabled yet.")
+
+    prompt = (
+        "Edit this photo: remove the background completely and replace it with "
+        "a clean, plain, solid white background. Keep the actual product/subject "
+        "in the photo exactly as it is — do not change, replace, warp, or redraw "
+        "it. Do NOT add any text, letters, numbers, or words anywhere in the "
+        "image. Output a high-quality image with only the background changed."
+    )
+    response = with_retry(
+        lambda: gemini_client.models.generate_content(
+            model="gemini-2.5-flash-image",
+            contents=[
+                genai_types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                prompt,
+            ],
+        ),
+        exceptions=(Exception,),
+        attempts=2,
+    )
+    for part in response.candidates[0].content.parts:
+        if part.inline_data is not None:
+            return part.inline_data.data
+    raise Exception("Gemini did not return an image")
+
+
+def _enhance_image(image_bytes: bytes, mime_type: str) -> bytes:
+    """Improves lighting, sharpness, and color on the user's own photo
+    without altering the product/composition — a cleanup pass, not a
+    background change."""
+    if gemini_client is None:
+        raise HTTPException(status_code=503, detail="AI image generation isn't enabled yet.")
+
+    prompt = (
+        "Edit this photo to improve its quality: fix lighting, increase "
+        "sharpness, correct color balance, and reduce noise/blur so it looks "
+        "professionally shot. Keep the actual product/subject, composition, "
+        "and background exactly as they are — only improve technical image "
+        "quality, do not add, remove, or move anything in the scene. Do NOT "
+        "add any text, letters, numbers, or words anywhere in the image."
+    )
+    response = with_retry(
+        lambda: gemini_client.models.generate_content(
+            model="gemini-2.5-flash-image",
+            contents=[
+                genai_types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                prompt,
+            ],
+        ),
+        exceptions=(Exception,),
+        attempts=2,
+    )
+    for part in response.candidates[0].content.parts:
+        if part.inline_data is not None:
+            return part.inline_data.data
+    raise Exception("Gemini did not return an image")
+
+
 @app.post("/ads/generate", response_model=AdGenerateResponse, tags=["ads"])
 @limiter.limit("10/minute")
 async def generate_ad(
@@ -640,6 +749,105 @@ async def generate_ad_image_variant(
             "banner_image_base64": base64.b64encode(banner_bytes).decode("ascii"),
             "credits_remaining": new_credits,
         }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/remove-background", response_model=AdImageVariantResponse, tags=["ads"])
+@limiter.limit("10/minute")
+async def remove_background(
+    request: Request,
+    file: UploadFile = File(...),
+    user_id: str = Depends(get_current_user_id),
+):
+    """Standalone quick-edit tool — same 1-credit-per-image-call pricing
+    as the main generation, since this hits the same paid Gemini image
+    model."""
+    try:
+        credits = _get_ad_credits(user_id)
+        if credits <= 0:
+            raise HTTPException(
+                status_code=402,
+                detail="You're out of ad credits. Upgrade to keep generating.",
+            )
+
+        image_bytes = await file.read()
+        mime_type = file.content_type or "image/jpeg"
+        result_bytes = await run_in_threadpool(_remove_background, image_bytes, mime_type)
+
+        new_credits = _spend_ad_credit(user_id)
+
+        return {
+            "banner_image_base64": base64.b64encode(result_bytes).decode("ascii"),
+            "credits_remaining": new_credits,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/enhance-image", response_model=AdImageVariantResponse, tags=["ads"])
+@limiter.limit("10/minute")
+async def enhance_image(
+    request: Request,
+    file: UploadFile = File(...),
+    user_id: str = Depends(get_current_user_id),
+):
+    """Standalone quick-edit tool — same 1-credit-per-image-call pricing
+    as the main generation, since this hits the same paid Gemini image
+    model."""
+    try:
+        credits = _get_ad_credits(user_id)
+        if credits <= 0:
+            raise HTTPException(
+                status_code=402,
+                detail="You're out of ad credits. Upgrade to keep generating.",
+            )
+
+        image_bytes = await file.read()
+        mime_type = file.content_type or "image/jpeg"
+        result_bytes = await run_in_threadpool(_enhance_image, image_bytes, mime_type)
+
+        new_credits = _spend_ad_credit(user_id)
+
+        return {
+            "banner_image_base64": base64.b64encode(result_bytes).decode("ascii"),
+            "credits_remaining": new_credits,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/translate-captions", response_model=TranslateCaptionsResponse, tags=["ads"])
+@limiter.limit("15/minute")
+def translate_captions(
+    request: Request,
+    req: TranslateCaptionsRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Free — text-only, translates captions already paid for by the
+    original generation. No credit spend."""
+    try:
+        target_language = (req.target_language or "").strip()
+        if not target_language:
+            raise HTTPException(status_code=400, detail="Pick a language to translate into.")
+        if not req.captions:
+            raise HTTPException(status_code=400, detail="No captions to translate.")
+
+        captions_in = [c.model_dump() for c in req.captions]
+        translated = _translate_captions(captions_in, target_language)
+        if not translated:
+            raise HTTPException(status_code=502, detail="Translation failed. Please try again.")
+
+        return {"captions": translated}
     except HTTPException:
         raise
     except Exception as e:
