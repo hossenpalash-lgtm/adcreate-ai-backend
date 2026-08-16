@@ -320,6 +320,16 @@ class BlogToPostsResponse(BaseModel):
     ideas: list[str]
 
 
+class CompetitorAnalysisRequest(BaseModel):
+    url: str
+
+
+class CompetitorAnalysisResponse(BaseModel):
+    competitor_name: str
+    summary: str
+    differentiation_ideas: list[str]
+
+
 # -----------------------
 # ENV / CLIENTS
 # -----------------------
@@ -956,6 +966,45 @@ Respond with ONLY this JSON format, nothing else:
     return [str(i).strip() for i in ideas if str(i).strip()][:8]
 
 
+def _generate_competitor_analysis(title: str, body_text: str, category: str) -> dict:
+    category_guidance = CONTENT_PLAN_CATEGORY_GUIDANCE.get(category, CONTENT_PLAN_CATEGORY_GUIDANCE["other"])
+    prompt = f"""You are a marketing strategist helping a small business understand a competitor.
+
+{category_guidance}
+
+Here is publicly visible information about a competitor:
+Name/Title: {title or "(unknown)"}
+Content: {body_text}
+
+Based ONLY on the information above — don't invent facts, prices, or claims you can't see there — write:
+1. A short 2-3 sentence summary of what this competitor seems to focus on or offer.
+2. 5 specific, actionable ways this business could differentiate itself or find a content angle the competitor likely isn't using.
+
+Respond with ONLY this JSON format, nothing else:
+{{"summary": "...", "differentiation_ideas": ["idea 1", "idea 2"]}}
+"""
+    response = with_retry(
+        lambda: client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You help small business owners understand a competitor and find ways to stand out, grounded only in what's actually given to you."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.6,
+        ),
+        exceptions=RETRYABLE_OPENAI_ERRORS,
+    )
+    ai_text = response.choices[0].message.content.strip()
+    m = re.search(r"```(?:json)?\n(.*?)```", ai_text, re.S)
+    ai_text_clean = m.group(1).strip() if m else ai_text.strip().strip("`").strip()
+    parsed = json.loads(ai_text_clean)
+    ideas = parsed.get("differentiation_ideas") or []
+    return {
+        "summary": str(parsed.get("summary") or "").strip(),
+        "differentiation_ideas": [str(i).strip() for i in ideas if str(i).strip()][:6],
+    }
+
+
 # Requesting the shape natively (rather than always generating square and
 # cropping/letterboxing afterward client-side) avoids the photo's actual
 # subject ever getting cropped into by the story/feed export. The
@@ -1414,6 +1463,39 @@ def blog_to_posts(
         if not ideas:
             raise HTTPException(status_code=502, detail="Couldn't come up with ideas from that article. Try another link.")
         return {"title": title, "ideas": ideas}
+    except HTTPException:
+        raise
+    except requests.RequestException:
+        raise HTTPException(status_code=400, detail="Couldn't reach that link.")
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/competitor-analysis", response_model=CompetitorAnalysisResponse, tags=["ads"])
+@limiter.limit("8/minute")
+def competitor_analysis(
+    request: Request,
+    req: CompetitorAnalysisRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Free — one fetch + one text-only GPT call, same pattern as
+    blog-to-posts. Works best on a competitor's own website; Facebook/
+    Instagram pages are JS-rendered, so only their public link-preview
+    meta tags (title/description) are reliably visible to a plain HTTP
+    fetch, not their actual post feed — no scraping login-gated content."""
+    try:
+        url = (req.url or "").strip()
+        if not url:
+            raise HTTPException(status_code=400, detail="Paste a competitor's website or page link.")
+        title, body_text = _extract_article_text(url)
+        if not title and not body_text:
+            raise HTTPException(status_code=422, detail="Couldn't find any content at that link.")
+        category = _get_business_category(user_id)
+        result = _generate_competitor_analysis(title, body_text, category)
+        if not result["summary"]:
+            raise HTTPException(status_code=502, detail="Couldn't analyze that link. Try another one.")
+        return {"competitor_name": title or "Competitor", **result}
     except HTTPException:
         raise
     except requests.RequestException:
