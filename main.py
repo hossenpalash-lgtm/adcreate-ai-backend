@@ -150,6 +150,21 @@ class AdCreditsOut(BaseModel):
     credits: int
 
 
+class ReferralRedeemRequest(BaseModel):
+    referrer_id: str
+
+
+class ReferralRedeemResponse(BaseModel):
+    granted: bool
+    credits_remaining: int
+
+
+class ReferralStatusOut(BaseModel):
+    referral_code: str
+    successful_referrals: int
+    max_referrals: int
+
+
 class AdCaptionVariant(BaseModel):
     facebook_caption: str
     whatsapp_message: str
@@ -488,6 +503,123 @@ def _spend_ad_credit(user_id: str) -> int:
 def ad_credits(user_id: str = Depends(get_current_user_id)):
     try:
         return {"credits": _get_ad_credits(user_id)}
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _add_ad_credits(user_id: str, amount: int) -> int:
+    """Grants bonus credits (referrals, etc.) rather than spending them —
+    the mirror of _spend_ad_credit. Ensures the row exists first, same
+    lazy-creation as everywhere else credits are touched."""
+    credits = _get_ad_credits(user_id)
+    new_credits = credits + amount
+    with_retry(lambda: supabase.table("ad_credits").update({
+        "credits": new_credits,
+        "updated_at": "now()",
+    }).eq("owner_id", user_id).execute())
+    return new_credits
+
+
+# -----------------------
+# REFERRALS
+# -----------------------
+# Both sides get a bonus once a referred account is confirmed real (its
+# own JWT-verified user_id, via get_current_user_id) — capped per referrer
+# to bound the cost of someone farming fake accounts against their own
+# code, same lesson as the sister app's voice-command referral bonus cap.
+REFERRAL_BONUS_CREDITS = 5
+REFERRAL_MAX_SUCCESSFUL = 5
+
+
+def _is_real_user(user_id: str) -> bool:
+    """A referrer_id arrives as a plain string in the request body, not
+    something JWT-verified like the caller's own id — confirm it actually
+    corresponds to a Supabase auth user before crediting it, rather than
+    silently creating a stray ad_credits row for a typo'd or made-up id."""
+    try:
+        resp = requests.get(
+            f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
+            headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
+            timeout=10,
+        )
+    except requests.RequestException:
+        return False
+    return resp.status_code == 200
+
+
+@app.post("/referral/redeem", response_model=ReferralRedeemResponse, tags=["referral"])
+@limiter.limit("10/minute")
+def redeem_referral(
+    request: Request,
+    req: ReferralRedeemRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Free — grants REFERRAL_BONUS_CREDITS to both sides, once per new
+    account (referee_id is unique, so a reload/retry after a successful
+    redemption is a harmless no-op rather than a double-grant)."""
+    try:
+        referrer_id = (req.referrer_id or "").strip()
+        if not referrer_id or referrer_id == user_id:
+            return {"granted": False, "credits_remaining": _get_ad_credits(user_id)}
+
+        already = with_retry(lambda: supabase.table("referrals")
+            .select("id")
+            .eq("referee_id", user_id)
+            .execute())
+        already = ensure_supabase_response(already, "check referral redemption")
+        if already.data:
+            return {"granted": False, "credits_remaining": _get_ad_credits(user_id)}
+
+        if not _is_real_user(referrer_id):
+            raise HTTPException(status_code=400, detail="That referral link isn't valid.")
+
+        count_res = with_retry(lambda: supabase.table("referrals")
+            .select("id", count="exact")
+            .eq("referrer_id", referrer_id)
+            .execute())
+        successful = count_res.count or 0
+        if successful >= REFERRAL_MAX_SUCCESSFUL:
+            # Referrer's already hit the cap — don't record this attempt,
+            # so a later real slot (if the referrer's count could ever
+            # drop) isn't blocked by a stale row, and the referee simply
+            # doesn't get a bonus for an already-capped code.
+            return {"granted": False, "credits_remaining": _get_ad_credits(user_id)}
+
+        try:
+            with_retry(lambda: supabase.table("referrals").insert({
+                "referrer_id": referrer_id,
+                "referee_id": user_id,
+            }).execute())
+        except APIError as e:
+            if e.code == "23505":
+                # Lost a race with a concurrent redemption for this same
+                # referee — already recorded, not a real failure.
+                return {"granted": False, "credits_remaining": _get_ad_credits(user_id)}
+            raise
+
+        new_credits = _add_ad_credits(user_id, REFERRAL_BONUS_CREDITS)
+        _add_ad_credits(referrer_id, REFERRAL_BONUS_CREDITS)
+        return {"granted": True, "credits_remaining": new_credits}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/referral/status", response_model=ReferralStatusOut, tags=["referral"])
+def referral_status(user_id: str = Depends(get_current_user_id)):
+    try:
+        count_res = with_retry(lambda: supabase.table("referrals")
+            .select("id", count="exact")
+            .eq("referrer_id", user_id)
+            .execute())
+        return {
+            "referral_code": user_id,
+            "successful_referrals": count_res.count or 0,
+            "max_referrals": REFERRAL_MAX_SUCCESSFUL,
+        }
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
