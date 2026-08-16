@@ -10,3 +10,4 @@ beautifulsoup4
 slowapi
 sentry-sdk[fastapi]
 google-genai
+imageio-ffmpeg

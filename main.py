@@ -24,6 +24,9 @@ import requests
 import sentry_sdk
 import ipaddress
 import socket
+import subprocess
+import tempfile
+import imageio_ffmpeg
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
@@ -173,10 +176,16 @@ class GenerateVideoRequest(BaseModel):
 
 class VideoOperationOut(BaseModel):
     operation: dict
+    headline: str
 
 
 class VideoStatusRequest(BaseModel):
     operation: dict
+    # Whatever the client currently has — the user can edit the AI-suggested
+    # headline any time during the 1-2 minute generation wait, and whatever
+    # it is at poll time is what gets burned onto the finished video. Empty
+    # string means the user cleared it deliberately — skip burn-in entirely.
+    headline: str = ""
 
 
 class VideoStatusResponse(BaseModel):
@@ -1447,6 +1456,80 @@ async def generate_ad_image_variant(
 
 VIDEO_CREDIT_COST = 10  # ~10x an image credit, matching Veo 3.1 Lite's real ~$0.40/8s-720p vs an image's ~$0.04
 VEO_MODEL = "veo-3.1-lite-generate-preview"
+VIDEO_FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "VideoOverlay-Bold.ttf")
+
+
+def _generate_video_headline(item_description: str, category: str) -> str:
+    """Free — a short on-screen hook, distinct from the longer Facebook
+    caption text (_generate_ad_copy): Veo has no reliable way to render
+    text itself (same limitation as the image model), so a real headline
+    only exists once burned on afterward — this generates what to burn.
+    Kept short on purpose so it fits one line at a legible size without
+    needing the wrapping logic compositeImage.ts uses for images."""
+    category_guidance = CONTENT_PLAN_CATEGORY_GUIDANCE.get(category, CONTENT_PLAN_CATEGORY_GUIDANCE["other"])
+    prompt = f"""You are writing a short on-screen text hook for a social media ad video for a small business.
+
+{category_guidance}
+
+The video is about: {item_description}
+
+Write ONE short, punchy headline for this video — 4 to 8 words, under 40 characters, no hashtags, no emoji, no quotation marks. It should work as a bold on-screen caption overlaid on the video, not a full sentence.
+
+Respond with ONLY the headline text, nothing else.
+"""
+    response = with_retry(
+        lambda: client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You write short, punchy on-screen video hooks for small business ads."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.7,
+        ),
+        exceptions=RETRYABLE_OPENAI_ERRORS,
+    )
+    headline = response.choices[0].message.content.strip().strip('"').strip("'")
+    return headline[:60]
+
+
+def _escape_ffmpeg_drawtext(text: str) -> str:
+    """drawtext's own mini-syntax treats \\, ', %, and : as special —
+    escape in the order that keeps escaping itself from being re-escaped."""
+    return (
+        text.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace(":", "\\:")
+        .replace("'", "\\'")
+    )
+
+
+def _burn_text_on_video(video_bytes: bytes, headline: str) -> bytes:
+    """Bakes the headline onto the video as a bottom caption bar, the
+    same visual role compositeImage.ts's caption bar plays for images —
+    real text the AI model itself can't reliably render. ffmpeg comes
+    from imageio-ffmpeg's bundled binary, no system ffmpeg install
+    needed (same reasoning as this app's earlier frame-extraction work)."""
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    escaped = _escape_ffmpeg_drawtext(headline)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        input_path = os.path.join(tmp_dir, "input.mp4")
+        output_path = os.path.join(tmp_dir, "output.mp4")
+        with open(input_path, "wb") as f:
+            f.write(video_bytes)
+
+        vf = (
+            f"drawtext=fontfile={VIDEO_FONT_PATH}:text='{escaped}':"
+            "fontcolor=white:fontsize=44:box=1:boxcolor=black@0.6:boxborderw=24:"
+            "x=(w-text_w)/2:y=h-text_h-50"
+        )
+        cmd = [ffmpeg_exe, "-y", "-i", input_path, "-vf", vf, "-c:a", "copy", output_path]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            logger.error("ffmpeg drawtext failed: %s", result.stderr[-2000:])
+            raise Exception("Couldn't add text to the video.")
+
+        with open(output_path, "rb") as f:
+            return f.read()
 
 
 @app.post("/ads/generate-video", response_model=VideoOperationOut, tags=["ads"])
@@ -1482,6 +1565,9 @@ def start_video_generation(
                 mime_type=req.image_mime_type or "image/jpeg",
             )
 
+        category = _get_business_category(user_id)
+        headline = _generate_video_headline(item_description, category)
+
         prompt = (
             f"A short, eye-catching social media ad video for a small business. {item_description}. "
             "Professional, well-lit, realistic. No on-screen text, captions, or logos."
@@ -1496,7 +1582,7 @@ def start_video_generation(
                 duration_seconds="8",
             ),
         )
-        return {"operation": operation.model_dump(mode="json")}
+        return {"operation": operation.model_dump(mode="json"), "headline": headline}
     except HTTPException:
         raise
     except Exception as e:
@@ -1530,6 +1616,17 @@ def check_video_status(
             raise HTTPException(status_code=502, detail="Video generation didn't return a video. Please try again.")
         generated = result.generated_videos[0]
         video_bytes = gemini_client.files.download(file=generated.video)
+
+        headline = (req.headline or "").strip()
+        if headline:
+            try:
+                video_bytes = _burn_text_on_video(video_bytes, headline)
+            except Exception as e:
+                # The raw video is still a perfectly usable result without
+                # its caption — not worth failing (and losing) an already-
+                # generated, already-about-to-be-charged-for video over a
+                # text-overlay step failing.
+                logger.error("Text burn-in failed, returning video without it: %s", str(e), exc_info=True)
 
         new_credits = _spend_ad_credits(user_id, VIDEO_CREDIT_COST)
         return {
