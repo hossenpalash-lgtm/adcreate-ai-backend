@@ -165,6 +165,26 @@ class ReferralStatusOut(BaseModel):
     max_referrals: int
 
 
+class GenerateVideoRequest(BaseModel):
+    item_description: str
+    image_base64: Optional[str] = None
+    image_mime_type: Optional[str] = None
+
+
+class VideoOperationOut(BaseModel):
+    operation: dict
+
+
+class VideoStatusRequest(BaseModel):
+    operation: dict
+
+
+class VideoStatusResponse(BaseModel):
+    done: bool
+    video_base64: Optional[str] = None
+    credits_remaining: Optional[int] = None
+
+
 class AdCaptionVariant(BaseModel):
     facebook_caption: str
     whatsapp_message: str
@@ -496,6 +516,24 @@ def _spend_ad_credit(user_id: str) -> int:
         "credits": new_credits,
         "updated_at": "now()",
     }).eq("owner_id", user_id).execute()
+    return new_credits
+
+
+def _spend_ad_credits(user_id: str, amount: int) -> int:
+    """Like _spend_ad_credit but for actions costing more than 1 (video) —
+    kept separate rather than generalizing the 1-credit callers onto this,
+    since those are already correct and this is only new for video."""
+    credits = _get_ad_credits(user_id)
+    if credits < amount:
+        raise HTTPException(
+            status_code=402,
+            detail=f"This needs {amount} credits — you have {credits}. Upgrade to keep generating.",
+        )
+    new_credits = credits - amount
+    with_retry(lambda: supabase.table("ad_credits").update({
+        "credits": new_credits,
+        "updated_at": "now()",
+    }).eq("owner_id", user_id).execute())
     return new_credits
 
 
@@ -1398,6 +1436,105 @@ async def generate_ad_image_variant(
 
         return {
             "banner_image_base64": base64.b64encode(banner_bytes).decode("ascii"),
+            "credits_remaining": new_credits,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+VIDEO_CREDIT_COST = 10  # ~10x an image credit, matching Veo 3.1 Lite's real ~$0.40/8s-720p vs an image's ~$0.04
+VEO_MODEL = "veo-3.1-lite-generate-preview"
+
+
+@app.post("/ads/generate-video", response_model=VideoOperationOut, tags=["ads"])
+@limiter.limit("5/minute")
+def start_video_generation(
+    request: Request,
+    req: GenerateVideoRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Starts a Veo video generation job. This alone doesn't spend a
+    credit — video generation genuinely takes 1-2+ minutes, far past any
+    reasonable HTTP request timeout, so this only kicks the job off and
+    hands back an opaque operation handle for the frontend to poll via
+    /ads/video-status. Credits are only spent there, once generation
+    actually succeeds, same as every other AI action in this app."""
+    try:
+        if gemini_client is None:
+            raise HTTPException(status_code=503, detail="Video generation isn't available right now.")
+        credits = _get_ad_credits(user_id)
+        if credits < VIDEO_CREDIT_COST:
+            raise HTTPException(
+                status_code=402,
+                detail=f"Video needs {VIDEO_CREDIT_COST} credits — you have {credits}.",
+            )
+        item_description = (req.item_description or "").strip()
+        if not item_description:
+            raise HTTPException(status_code=400, detail="Tell us what the video is about.")
+
+        image = None
+        if req.image_base64:
+            image = genai_types.Image(
+                image_bytes=base64.b64decode(req.image_base64),
+                mime_type=req.image_mime_type or "image/jpeg",
+            )
+
+        prompt = (
+            f"A short, eye-catching social media ad video for a small business. {item_description}. "
+            "Professional, well-lit, realistic. No on-screen text, captions, or logos."
+        )
+        operation = gemini_client.models.generate_videos(
+            model=VEO_MODEL,
+            prompt=prompt,
+            image=image,
+            config=genai_types.GenerateVideosConfig(
+                aspect_ratio="16:9",
+                resolution="720p",
+                duration_seconds="8",
+            ),
+        )
+        return {"operation": operation.model_dump(mode="json")}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/video-status", response_model=VideoStatusResponse, tags=["ads"])
+@limiter.limit("30/minute")
+def check_video_status(
+    request: Request,
+    req: VideoStatusRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Stateless polling — the operation handle round-trips through the
+    client instead of being kept in server memory, so a mid-generation
+    backend restart/redeploy on Render doesn't strand anyone's job."""
+    try:
+        if gemini_client is None:
+            raise HTTPException(status_code=503, detail="Video generation isn't available right now.")
+        operation = genai_types.GenerateVideosOperation.model_validate(req.operation)
+        operation = gemini_client.operations.get(operation)
+        if not operation.done:
+            return {"done": False, "video_base64": None, "credits_remaining": None}
+
+        if operation.error:
+            raise HTTPException(status_code=502, detail="Video generation failed. Please try again.")
+
+        result = operation.result or operation.response
+        if not result or not result.generated_videos:
+            raise HTTPException(status_code=502, detail="Video generation didn't return a video. Please try again.")
+        generated = result.generated_videos[0]
+        video_bytes = gemini_client.files.download(file=generated.video)
+
+        new_credits = _spend_ad_credits(user_id, VIDEO_CREDIT_COST)
+        return {
+            "done": True,
+            "video_base64": base64.b64encode(video_bytes).decode("ascii"),
             "credits_remaining": new_credits,
         }
     except HTTPException:
