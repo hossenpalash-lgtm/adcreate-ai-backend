@@ -307,6 +307,19 @@ class SuggestHashtagsResponse(BaseModel):
     hashtags: list[str]
 
 
+class IdeaLabsResponse(BaseModel):
+    ideas: list[str]
+
+
+class BlogToPostsRequest(BaseModel):
+    url: str
+
+
+class BlogToPostsResponse(BaseModel):
+    title: str
+    ideas: list[str]
+
+
 # -----------------------
 # ENV / CLIENTS
 # -----------------------
@@ -729,6 +742,39 @@ Respond with ONLY this JSON format, nothing else:
     return [str(t).lstrip("#").strip() for t in tags if str(t).strip()][:15]
 
 
+def _generate_idea_labs_ideas(category: str) -> list[str]:
+    """Free — text-only GPT call. For a user with no specific product in
+    mind yet: general post ideas grounded only in their saved business
+    category, not any real inventory/sales data (this app has none)."""
+    category_guidance = CONTENT_PLAN_CATEGORY_GUIDANCE.get(category, CONTENT_PLAN_CATEGORY_GUIDANCE["other"])
+    prompt = f"""You are a social media content strategist for a small business.
+
+{category_guidance}
+
+The business owner has no specific product or offer in mind right now — they just want ideas for what to post about next. Suggest 8 distinct, concrete post ideas a small business in this category could realistically write today. Don't invent fake stats, prices, or specific products you can't know about — keep ideas general enough to apply, but concrete and actionable, e.g. "Show a before/after of your most requested service" rather than vague advice like "engage your audience."
+
+Respond with ONLY this JSON format, nothing else:
+{{"ideas": ["idea 1", "idea 2"]}}
+"""
+    response = with_retry(
+        lambda: client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You give small business owners concrete social media post ideas when they don't have a specific product in mind yet."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.8,
+        ),
+        exceptions=RETRYABLE_OPENAI_ERRORS,
+    )
+    ai_text = response.choices[0].message.content.strip()
+    m = re.search(r"```(?:json)?\n(.*?)```", ai_text, re.S)
+    ai_text_clean = m.group(1).strip() if m else ai_text.strip().strip("`").strip()
+    parsed = json.loads(ai_text_clean)
+    ideas = parsed.get("ideas") or []
+    return [str(i).strip() for i in ideas if str(i).strip()][:10]
+
+
 def _translate_captions(captions: list[dict], target_language: str) -> list[dict]:
     """Text-only, reuses the already-generated captions instead of
     regenerating from scratch — cheap enough (gpt-4o-mini, small prompt)
@@ -848,6 +894,66 @@ def _fetch_product_from_link(url: str) -> dict:
         "image_base64": image_base64,
         "mime_type": mime_type,
     }
+
+
+_MAX_ARTICLE_CHARS = 6000  # plenty for GPT to find several distinct angles without blowing up the prompt
+
+
+def _extract_article_text(url: str) -> tuple[str, str]:
+    """Free — fetch + parse only, no AI call. Reuses the same SSRF-safe
+    fetch as fetch-product-link, but pulls paragraph body text instead of
+    just Open Graph tags — turning an article into several distinct post
+    angles needs actual content, not just a title/description."""
+    html_bytes, _ = _fetch_url_bytes(url)
+    soup = BeautifulSoup(html_bytes, "html.parser")
+
+    title = None
+    tag = soup.find("meta", attrs={"property": "og:title"})
+    if tag and tag.get("content"):
+        title = tag["content"].strip()
+    if not title and soup.title and soup.title.string:
+        title = soup.title.string.strip()
+
+    paragraphs = soup.find_all("p")
+    body_text = " ".join(p.get_text(" ", strip=True) for p in paragraphs)
+    body_text = re.sub(r"\s+", " ", body_text).strip()[:_MAX_ARTICLE_CHARS]
+
+    return title or "", body_text
+
+
+def _generate_post_ideas_from_article(title: str, body_text: str, category: str) -> list[str]:
+    category_guidance = CONTENT_PLAN_CATEGORY_GUIDANCE.get(category, CONTENT_PLAN_CATEGORY_GUIDANCE["other"])
+    prompt = f"""You are a social media content strategist for a small business.
+
+{category_guidance}
+
+The business owner found this article/blog post and wants social media post ideas inspired by it:
+
+Title: {title or "(no title found)"}
+Content: {body_text}
+
+Suggest 6 distinct social media post ideas this business could write, each taking a different angle inspired by the article above (e.g. a tip from it, a reaction to it, a way to relate it to their own product/service). Don't just summarize the article — turn it into original post ideas for this business, in this business's voice. Keep each idea to one short, concrete line.
+
+Respond with ONLY this JSON format, nothing else:
+{{"ideas": ["idea 1", "idea 2"]}}
+"""
+    response = with_retry(
+        lambda: client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You turn a blog or news article into original social media post ideas for a small business."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.7,
+        ),
+        exceptions=RETRYABLE_OPENAI_ERRORS,
+    )
+    ai_text = response.choices[0].message.content.strip()
+    m = re.search(r"```(?:json)?\n(.*?)```", ai_text, re.S)
+    ai_text_clean = m.group(1).strip() if m else ai_text.strip().strip("`").strip()
+    parsed = json.loads(ai_text_clean)
+    ideas = parsed.get("ideas") or []
+    return [str(i).strip() for i in ideas if str(i).strip()][:8]
 
 
 # Requesting the shape natively (rather than always generating square and
@@ -1241,6 +1347,23 @@ def suggest_hashtags(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/ads/idea-labs", response_model=IdeaLabsResponse, tags=["ads"])
+@limiter.limit("10/minute")
+def idea_labs(request: Request, user_id: str = Depends(get_current_user_id)):
+    """Free — text-only GPT call. General post inspiration for a user
+    with no specific product typed in yet, grounded only in their saved
+    business category."""
+    try:
+        category = _get_business_category(user_id)
+        ideas = _generate_idea_labs_ideas(category)
+        return {"ideas": ideas}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/ads/fetch-product-link", response_model=FetchProductLinkResponse, tags=["ads"])
 @limiter.limit("10/minute")
 def fetch_product_link(
@@ -1259,6 +1382,38 @@ def fetch_product_link(
         if not result["title"] and not result["description"]:
             raise HTTPException(status_code=422, detail="Couldn't find product info at that link.")
         return result
+    except HTTPException:
+        raise
+    except requests.RequestException:
+        raise HTTPException(status_code=400, detail="Couldn't reach that link.")
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/blog-to-posts", response_model=BlogToPostsResponse, tags=["ads"])
+@limiter.limit("8/minute")
+def blog_to_posts(
+    request: Request,
+    req: BlogToPostsRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Free — one fetch + one text-only GPT call. Turns a blog/article
+    link into several distinct post ideas, unlike fetch-product-link
+    which extracts one product's info — an article has no single product
+    to pull out, so this generates ideas inspired by it instead."""
+    try:
+        url = (req.url or "").strip()
+        if not url:
+            raise HTTPException(status_code=400, detail="Paste a blog or article link.")
+        title, body_text = _extract_article_text(url)
+        if not body_text:
+            raise HTTPException(status_code=422, detail="Couldn't find any article content at that link.")
+        category = _get_business_category(user_id)
+        ideas = _generate_post_ideas_from_article(title, body_text, category)
+        if not ideas:
+            raise HTTPException(status_code=502, detail="Couldn't come up with ideas from that article. Try another link.")
+        return {"title": title, "ideas": ideas}
     except HTTPException:
         raise
     except requests.RequestException:
