@@ -27,6 +27,8 @@ import socket
 import subprocess
 import tempfile
 import imageio_ffmpeg
+import csv
+import io
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
@@ -192,6 +194,27 @@ class VideoStatusResponse(BaseModel):
     done: bool
     video_base64: Optional[str] = None
     credits_remaining: Optional[int] = None
+
+
+class ImportedProductOut(BaseModel):
+    id: str
+    name: str
+    description: Optional[str] = None
+    price: Optional[str] = None
+    image_url: Optional[str] = None
+
+
+class ImportedProductsListResponse(BaseModel):
+    products: list[ImportedProductOut]
+
+
+class FetchProductImageRequest(BaseModel):
+    url: str
+
+
+class FetchProductImageResponse(BaseModel):
+    image_base64: str
+    mime_type: str
 
 
 class AdCaptionVariant(BaseModel):
@@ -1085,6 +1108,64 @@ def _fetch_product_from_link(url: str) -> dict:
     }
 
 
+_MAX_IMPORTED_PRODUCTS = 200
+_MAX_CSV_BYTES = 2 * 1024 * 1024
+
+# Matched case-insensitively against a CSV's header row — covers both our
+# own simple template (name/description/price/image_url) and real-world
+# Shopify/WooCommerce export headers, so a seller can upload a file
+# straight from their existing store without reformatting it first.
+_PRODUCT_CSV_COLUMN_ALIASES = {
+    "name": {"name", "title", "product name", "product title"},
+    "description": {"description", "body (html)", "body", "product description", "details"},
+    "price": {"price", "variant price", "cost"},
+    "image_url": {"image_url", "image url", "image_src", "image src", "image", "photo", "photo url", "picture"},
+}
+
+
+def _parse_product_csv(content: bytes) -> list[dict]:
+    text = content.decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        raise HTTPException(status_code=400, detail="That CSV file looks empty.")
+
+    column_map: dict[str, str] = {}
+    for field, aliases in _PRODUCT_CSV_COLUMN_ALIASES.items():
+        for header in reader.fieldnames:
+            if header and header.strip().lower() in aliases:
+                column_map[field] = header
+                break
+
+    if "name" not in column_map:
+        raise HTTPException(
+            status_code=400,
+            detail="Couldn't find a product name column. Make sure your CSV has a 'name' (or 'Title') column.",
+        )
+
+    products = []
+    for row in reader:
+        name = (row.get(column_map["name"]) or "").strip()
+        if not name:
+            continue
+        # Shopify's "Body (HTML)" column is raw HTML — stripping tags here
+        # keeps it out of both the catalog list display and the AI prompt
+        # this text later feeds into when a product is picked.
+        raw_description = (row.get(column_map.get("description", ""), "") or "").strip()
+        description = BeautifulSoup(raw_description, "html.parser").get_text(" ", strip=True) if raw_description else ""
+        products.append({
+            "name": name[:200],
+            "description": description[:2000] or None,
+            "price": (row.get(column_map.get("price", ""), "") or "").strip()[:50] or None,
+            "image_url": (row.get(column_map.get("image_url", ""), "") or "").strip()[:2000] or None,
+        })
+        if len(products) >= _MAX_IMPORTED_PRODUCTS:
+            break
+
+    if not products:
+        raise HTTPException(status_code=400, detail="No valid product rows found in that CSV.")
+    return products
+
+
 _MAX_ARTICLE_CHARS = 6000  # plenty for GPT to find several distinct angles without blowing up the prompt
 
 
@@ -1801,6 +1882,84 @@ def fetch_product_link(
         raise
     except requests.RequestException:
         raise HTTPException(status_code=400, detail="Couldn't reach that link.")
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/products/import-csv", response_model=ImportedProductsListResponse, tags=["products"])
+@limiter.limit("5/minute")
+async def import_products_csv(
+    request: Request,
+    file: UploadFile = File(...),
+    user_id: str = Depends(get_current_user_id),
+):
+    """Replaces the user's whole saved catalog with what's in this file —
+    "here's my current product list," not an accumulating import log, so
+    re-uploading a corrected file doesn't leave stale duplicates behind."""
+    try:
+        content = await file.read()
+        if len(content) > _MAX_CSV_BYTES:
+            raise HTTPException(status_code=400, detail="That file is too large (max 2MB).")
+        products = _parse_product_csv(content)
+        with_retry(lambda: supabase.table("imported_products").delete().eq("owner_id", user_id).execute())
+        rows = [{"owner_id": user_id, **p} for p in products]
+        res = with_retry(lambda: supabase.table("imported_products").insert(rows).execute())
+        res = ensure_supabase_response(res, "import products")
+        return {"products": res.data}
+    except HTTPException:
+        raise
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="Couldn't read that file — please upload a CSV.")
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/products", response_model=ImportedProductsListResponse, tags=["products"])
+def list_products(user_id: str = Depends(get_current_user_id)):
+    try:
+        res = with_retry(lambda: supabase.table("imported_products")
+            .select("id, name, description, price, image_url")
+            .eq("owner_id", user_id)
+            .order("created_at", desc=False)
+            .execute())
+        res = ensure_supabase_response(res, "list products")
+        return {"products": res.data}
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/products", tags=["products"])
+def clear_products(user_id: str = Depends(get_current_user_id)):
+    try:
+        supabase.table("imported_products").delete().eq("owner_id", user_id).execute()
+        return {"deleted": True}
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/products/fetch-image", response_model=FetchProductImageResponse, tags=["products"])
+@limiter.limit("20/minute")
+def fetch_product_image(request: Request, req: FetchProductImageRequest, user_id: str = Depends(get_current_user_id)):
+    """Same SSRF-safe fetch as fetch-stock-photo, but not restricted to a
+    single host — CSV-imported image URLs can point at any store's own
+    CDN (Shopify, WooCommerce, etc.), unlike the curated Pexels search."""
+    try:
+        url = (req.url or "").strip()
+        if not url:
+            raise HTTPException(status_code=400, detail="No image URL provided.")
+        image_bytes, content_type = _fetch_url_bytes(url)
+        return {
+            "image_base64": base64.b64encode(image_bytes).decode("ascii"),
+            "mime_type": content_type or "image/jpeg",
+        }
+    except HTTPException:
+        raise
+    except requests.RequestException:
+        raise HTTPException(status_code=400, detail="Couldn't fetch that image.")
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
