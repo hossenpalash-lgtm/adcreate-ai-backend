@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, field_validator
 from openai import OpenAI, APIConnectionError, APITimeoutError, RateLimitError
 from google import genai
@@ -29,7 +29,10 @@ import tempfile
 import imageio_ffmpeg
 import csv
 import io
-from urllib.parse import urlparse
+import hmac
+import hashlib
+import secrets
+from urllib.parse import urlparse, urlencode
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
 
@@ -223,6 +226,19 @@ class FetchProductImageRequest(BaseModel):
 class FetchProductImageResponse(BaseModel):
     image_base64: str
     mime_type: str
+
+
+class ShopifyConnectRequest(BaseModel):
+    shop: str
+
+
+class ShopifyConnectUrlResponse(BaseModel):
+    authorize_url: str
+
+
+class ShopifyStatusResponse(BaseModel):
+    connected: bool
+    shop_domain: Optional[str] = None
 
 
 class AdCaptionVariant(BaseModel):
@@ -426,6 +442,18 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 # Optional — only stock-photo search needs this, same reasoning as above.
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()
+# Optional — only Shopify connect needs these.
+SHOPIFY_CLIENT_ID = os.getenv("SHOPIFY_CLIENT_ID", "").strip()
+SHOPIFY_CLIENT_SECRET = os.getenv("SHOPIFY_CLIENT_SECRET", "").strip()
+SHOPIFY_API_VERSION = "2026-07"
+# Where the browser lands after completing (or cancelling) the Shopify
+# OAuth flow — reuses the same env var CORS already trusts as "the real
+# frontend," so there's no separate env var to keep in sync.
+FRONTEND_URL = (ALLOWED_ORIGINS[0] if ALLOWED_ORIGINS else "http://localhost:3001").rstrip("/")
+# This backend's own public URL — must exactly match a redirect URL
+# registered in the Shopify app's settings, so it's explicit rather than
+# derived from the request (which can be unreliable behind a proxy).
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000").strip().rstrip("/")
 
 if not OPENAI_API_KEY:
     raise Exception("Missing OPENAI_API_KEY")
@@ -1184,6 +1212,120 @@ def _parse_product_csv(content: bytes) -> list[dict]:
 
     if not products:
         raise HTTPException(status_code=400, detail="No valid product rows found in that CSV.")
+    return products
+
+
+_SHOPIFY_STATE_SEP = "."
+
+
+def _normalize_shopify_domain(shop: str) -> str:
+    """Accepts either "mystore" or "mystore.myshopify.com" from the user
+    and returns the canonical form — also the safety boundary for this
+    feature, since the result gets built directly into an outbound OAuth
+    URL and API calls, so it's validated as a plausible Shopify handle
+    rather than trusted as-is."""
+    shop = (shop or "").strip().lower()
+    if not shop:
+        raise HTTPException(status_code=400, detail="Enter your Shopify store's domain.")
+    if not shop.endswith(".myshopify.com"):
+        shop = f"{shop}.myshopify.com"
+    prefix = shop[: -len(".myshopify.com")]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9\-]*", prefix):
+        raise HTTPException(status_code=400, detail="That doesn't look like a valid Shopify store domain.")
+    return shop
+
+
+def _sign_shopify_state(user_id: str) -> str:
+    """Ties the OAuth state param to a specific Punqle user — the
+    redirect back from Shopify is a plain browser navigation and can't
+    carry our normal Bearer auth header, so this signed state is what
+    tells /shopify/callback which account to attach the connection to."""
+    nonce = secrets.token_urlsafe(16)
+    payload = f"{user_id}{_SHOPIFY_STATE_SEP}{nonce}"
+    signature = hmac.new(SHOPIFY_CLIENT_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}{_SHOPIFY_STATE_SEP}{signature}"
+
+
+def _verify_shopify_state(state: str) -> str:
+    parts = (state or "").split(_SHOPIFY_STATE_SEP)
+    if len(parts) != 3:
+        raise HTTPException(status_code=400, detail="Invalid or expired connection request.")
+    user_id, nonce, signature = parts
+    payload = f"{user_id}{_SHOPIFY_STATE_SEP}{nonce}"
+    expected = hmac.new(SHOPIFY_CLIENT_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        raise HTTPException(status_code=400, detail="Invalid or expired connection request.")
+    return user_id
+
+
+def _verify_shopify_callback_hmac(params: dict) -> bool:
+    """Shopify signs every OAuth callback with an hmac computed over the
+    other query params using our client secret — verifying this proves
+    the request genuinely came from Shopify and wasn't forged."""
+    received = params.get("hmac", "")
+    filtered = {k: v for k, v in params.items() if k != "hmac"}
+    message = "&".join(f"{k}={v}" for k, v in sorted(filtered.items()))
+    expected = hmac.new(SHOPIFY_CLIENT_SECRET.encode(), message.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, received)
+
+
+def _fetch_shopify_products(shop_domain: str, access_token: str) -> list[dict]:
+    """GraphQL, not REST — this app was registered after Shopify's April
+    2025 cutoff, past which new apps only get GraphQL Admin API access;
+    the REST /products.json endpoint is deprecated for products
+    specifically regardless of when the app was created."""
+    query = """
+    {
+      products(first: 100) {
+        edges {
+          node {
+            title
+            descriptionHtml
+            featuredImage { url }
+            variants(first: 1) {
+              edges { node { price } }
+            }
+          }
+        }
+      }
+    }
+    """
+    resp = with_retry(
+        lambda: requests.post(
+            f"https://{shop_domain}/admin/api/{SHOPIFY_API_VERSION}/graphql.json",
+            headers={"X-Shopify-Access-Token": access_token, "Content-Type": "application/json"},
+            json={"query": query},
+            timeout=15,
+        ),
+        exceptions=(requests.RequestException,),
+        attempts=2,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "errors" in data:
+        raise HTTPException(status_code=502, detail="Shopify couldn't return your products.")
+
+    products = []
+    for edge in data.get("data", {}).get("products", {}).get("edges", []):
+        node = edge["node"]
+        name = (node.get("title") or "").strip()
+        if not name:
+            continue
+        description_html = node.get("descriptionHtml") or ""
+        description = (
+            BeautifulSoup(description_html, "html.parser").get_text(" ", strip=True) if description_html else ""
+        )
+        variant_edges = node.get("variants", {}).get("edges", [])
+        price = variant_edges[0]["node"]["price"] if variant_edges else None
+        image = node.get("featuredImage")
+        products.append({
+            "name": name[:200],
+            "description": description[:2000] or None,
+            "price": price,
+            "image_url": image["url"] if image else None,
+        })
+        if len(products) >= _MAX_IMPORTED_PRODUCTS:
+            break
     return products
 
 
@@ -1986,6 +2128,155 @@ def fetch_product_image(request: Request, req: FetchProductImageRequest, user_id
         raise
     except requests.RequestException:
         raise HTTPException(status_code=400, detail="Couldn't fetch that image.")
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/shopify/connect-url", response_model=ShopifyConnectUrlResponse, tags=["shopify"])
+@limiter.limit("10/minute")
+def get_shopify_connect_url(
+    request: Request,
+    req: ShopifyConnectRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Returns the Shopify OAuth authorize URL for the frontend to
+    navigate the browser to directly — generated via an authenticated
+    API call (using our normal Bearer-token pattern) specifically so the
+    signed state param can be tied to this user, since the subsequent
+    browser redirect to and from Shopify can't carry that header itself."""
+    if not SHOPIFY_CLIENT_ID or not SHOPIFY_CLIENT_SECRET:
+        raise HTTPException(status_code=503, detail="Shopify connect isn't available right now.")
+    try:
+        shop_domain = _normalize_shopify_domain(req.shop)
+        state = _sign_shopify_state(user_id)
+        params = {
+            "client_id": SHOPIFY_CLIENT_ID,
+            "scope": "read_products",
+            "redirect_uri": f"{BACKEND_URL}/shopify/callback",
+            "state": state,
+        }
+        return {"authorize_url": f"https://{shop_domain}/admin/oauth/authorize?{urlencode(params)}"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/shopify/callback", tags=["shopify"])
+def shopify_oauth_callback(request: Request):
+    """Shopify redirects the merchant's browser here after they approve
+    (or decline) the connection — a plain GET navigation, not an
+    authenticated API call, so this route trusts Shopify's own hmac
+    signature plus our signed state param instead of a Bearer token."""
+    try:
+        params = dict(request.query_params)
+        if not SHOPIFY_CLIENT_ID or not SHOPIFY_CLIENT_SECRET:
+            return RedirectResponse(f"{FRONTEND_URL}/?shopify=error")
+        if not _verify_shopify_callback_hmac(params):
+            logger.error("Shopify callback failed hmac verification")
+            return RedirectResponse(f"{FRONTEND_URL}/?shopify=error")
+
+        shop = params.get("shop", "")
+        code = params.get("code", "")
+        if not shop or not code or not shop.endswith(".myshopify.com"):
+            return RedirectResponse(f"{FRONTEND_URL}/?shopify=error")
+
+        user_id = _verify_shopify_state(params.get("state", ""))
+
+        token_resp = with_retry(
+            lambda: requests.post(
+                f"https://{shop}/admin/oauth/access_token",
+                json={
+                    "client_id": SHOPIFY_CLIENT_ID,
+                    "client_secret": SHOPIFY_CLIENT_SECRET,
+                    "code": code,
+                },
+                timeout=15,
+            ),
+            exceptions=(requests.RequestException,),
+            attempts=2,
+        )
+        token_resp.raise_for_status()
+        access_token = token_resp.json().get("access_token")
+        if not access_token:
+            return RedirectResponse(f"{FRONTEND_URL}/?shopify=error")
+
+        with_retry(lambda: supabase.table("shopify_connections").upsert({
+            "owner_id": user_id,
+            "shop_domain": shop,
+            "access_token": access_token,
+            "connected_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="owner_id").execute())
+
+        return RedirectResponse(f"{FRONTEND_URL}/?shopify=connected")
+    except HTTPException:
+        return RedirectResponse(f"{FRONTEND_URL}/?shopify=error")
+    except requests.RequestException:
+        return RedirectResponse(f"{FRONTEND_URL}/?shopify=error")
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        return RedirectResponse(f"{FRONTEND_URL}/?shopify=error")
+
+
+@app.get("/shopify/status", response_model=ShopifyStatusResponse, tags=["shopify"])
+def get_shopify_status(user_id: str = Depends(get_current_user_id)):
+    try:
+        res = with_retry(lambda: supabase.table("shopify_connections")
+            .select("shop_domain")
+            .eq("owner_id", user_id)
+            .execute())
+        res = ensure_supabase_response(res, "get shopify connection status")
+        if res.data:
+            return {"connected": True, "shop_domain": res.data[0]["shop_domain"]}
+        return {"connected": False, "shop_domain": None}
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/shopify/disconnect", tags=["shopify"])
+def disconnect_shopify(user_id: str = Depends(get_current_user_id)):
+    try:
+        supabase.table("shopify_connections").delete().eq("owner_id", user_id).execute()
+        return {"disconnected": True}
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/shopify/sync", response_model=ImportedProductsListResponse, tags=["shopify"])
+@limiter.limit("10/minute")
+def sync_shopify_products(request: Request, user_id: str = Depends(get_current_user_id)):
+    """Replaces the user's whole imported_products catalog with what's
+    currently in their connected Shopify store — same delete-then-insert
+    semantics as CSV import, and reuses the exact same table, so the
+    existing ProductPicker/ProductCatalogPanel need zero changes to
+    display Shopify-sourced products."""
+    try:
+        res = with_retry(lambda: supabase.table("shopify_connections")
+            .select("shop_domain, access_token")
+            .eq("owner_id", user_id)
+            .execute())
+        res = ensure_supabase_response(res, "get shopify connection")
+        if not res.data:
+            raise HTTPException(status_code=400, detail="Connect your Shopify store first.")
+        connection = res.data[0]
+
+        products = _fetch_shopify_products(connection["shop_domain"], connection["access_token"])
+        if not products:
+            raise HTTPException(status_code=400, detail="No products found in your Shopify store.")
+
+        with_retry(lambda: supabase.table("imported_products").delete().eq("owner_id", user_id).execute())
+        rows = [{"owner_id": user_id, **p} for p in products]
+        insert_res = with_retry(lambda: supabase.table("imported_products").insert(rows).execute())
+        insert_res = ensure_supabase_response(insert_res, "sync shopify products")
+        return {"products": insert_res.data}
+    except HTTPException:
+        raise
+    except requests.RequestException:
+        raise HTTPException(status_code=400, detail="Couldn't reach your Shopify store.")
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
