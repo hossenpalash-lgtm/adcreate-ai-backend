@@ -174,6 +174,14 @@ class GenerateVideoRequest(BaseModel):
     item_description: str
     image_base64: Optional[str] = None
     image_mime_type: Optional[str] = None
+    aspect_ratio: str = "16:9"
+
+    @field_validator("aspect_ratio")
+    @classmethod
+    def validate_video_aspect_ratio(cls, v):
+        if v not in ("16:9", "9:16"):
+            raise ValueError("aspect_ratio must be '16:9' or '9:16'")
+        return v
 
 
 class VideoOperationOut(BaseModel):
@@ -1611,10 +1619,15 @@ def _burn_text_on_video(video_bytes: bytes, headline: str) -> bytes:
         with open(input_path, "wb") as f:
             f.write(video_bytes)
 
+        # Sized relative to the video's own width/height (not fixed
+        # pixels) — a fixed 44px font tuned for a 1280px-wide 16:9 frame
+        # overflowed both edges on a 720px-wide 9:16 frame once the
+        # aspect-ratio picker shipped. Ratios below match what the old
+        # fixed values worked out to on the original 1280x720 frame.
         vf = (
             f"drawtext=fontfile={VIDEO_FONT_PATH}:text='{escaped}':"
-            "fontcolor=white:fontsize=44:box=1:boxcolor=black@0.6:boxborderw=24:"
-            "x=(w-text_w)/2:y=h-text_h-50"
+            "fontcolor=white:fontsize=w*0.0344:box=1:boxcolor=black@0.6:boxborderw=w*0.01875:"
+            "x=(w-text_w)/2:y=h-text_h-h*0.0694"
         )
         cmd = [ffmpeg_exe, "-y", "-i", input_path, "-vf", vf, "-c:a", "copy", output_path]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -1671,7 +1684,7 @@ def start_video_generation(
             prompt=prompt,
             image=image,
             config=genai_types.GenerateVideosConfig(
-                aspect_ratio="16:9",
+                aspect_ratio=req.aspect_ratio,
                 resolution="720p",
                 duration_seconds="8",
             ),
