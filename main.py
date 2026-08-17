@@ -40,7 +40,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-logger = logging.getLogger("adcreate")
+logger = logging.getLogger("punqle")
 
 # -----------------------
 # LOAD ENV
@@ -84,7 +84,7 @@ def with_retry(fn: Callable[[], T], attempts: int = 3, delay: float = 1.0, excep
 # CREATE APP
 # -----------------------
 app = FastAPI(
-    title="AdCreate.AI Backend",
+    title="Punqle Backend",
     description="API for generating AI ad copy, banner images, and weekly content plans for small businesses.",
     version="0.1.0"
 )
@@ -481,7 +481,7 @@ def get_current_user_id(authorization: Optional[str] = Header(None)) -> str:
 
 @app.get("/")
 def home():
-    return {"status": "AdCreate.AI backend is running"}
+    return {"status": "Punqle backend is running"}
 
 
 # -----------------------
@@ -1056,7 +1056,7 @@ def _fetch_url_bytes(url: str) -> tuple[bytes, str]:
         lambda: requests.get(
             url,
             timeout=10,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; AdCreateAI/1.0)"},
+            headers={"User-Agent": "Mozilla/5.0 (compatible; Punqle/1.0)"},
             stream=True,
         ),
         exceptions=(requests.RequestException,),
