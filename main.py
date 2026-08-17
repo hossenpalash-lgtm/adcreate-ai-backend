@@ -266,6 +266,7 @@ class BusinessProfileOut(BaseModel):
     brand_color: Optional[str] = None
     logo_base64: Optional[str] = None
     logo_mime_type: Optional[str] = None
+    brand_name: Optional[str] = None
 
 
 class SetBusinessProfileRequest(BaseModel):
@@ -277,6 +278,14 @@ class SetBusinessProfileRequest(BaseModel):
     brand_color: Optional[str] = None
     logo_base64: Optional[str] = None
     logo_mime_type: Optional[str] = None
+    brand_name: Optional[str] = None
+
+    @field_validator("brand_name")
+    @classmethod
+    def validate_brand_name(cls, v):
+        if v is not None and len(v) > 60:
+            raise ValueError("Business name is too long (max 60 characters).")
+        return v
 
     @field_validator("category")
     @classmethod
@@ -782,7 +791,7 @@ def _set_business_category(user_id: str, category: str) -> None:
 
 def _get_business_profile(user_id: str) -> dict:
     res = with_retry(lambda: supabase.table("business_profile")
-        .select("category, brand_color, logo_base64, logo_mime_type")
+        .select("category, brand_color, logo_base64, logo_mime_type, brand_name")
         .eq("owner_id", user_id)
         .execute())
     res = ensure_supabase_response(res, "get business profile")
@@ -793,8 +802,9 @@ def _get_business_profile(user_id: str) -> dict:
             "brand_color": row.get("brand_color"),
             "logo_base64": row.get("logo_base64"),
             "logo_mime_type": row.get("logo_mime_type"),
+            "brand_name": row.get("brand_name"),
         }
-    return {"category": "other", "brand_color": None, "logo_base64": None, "logo_mime_type": None}
+    return {"category": "other", "brand_color": None, "logo_base64": None, "logo_mime_type": None, "brand_name": None}
 
 
 def _update_business_profile(
@@ -803,10 +813,11 @@ def _update_business_profile(
     brand_color: Optional[str] = None,
     logo_base64: Optional[str] = None,
     logo_mime_type: Optional[str] = None,
+    brand_name: Optional[str] = None,
 ) -> dict:
     """Fetch-then-merge partial update — each field is only overwritten
     if the caller actually provided it, so the Brand Kit panel (color +
-    logo) and the Weekly Plan category picker don't stomp on each
+    logo + name) and the Weekly Plan category picker don't stomp on each
     other's fields when saving independently."""
     current = _get_business_profile(user_id)
     payload = {
@@ -815,10 +826,11 @@ def _update_business_profile(
         "brand_color": brand_color if brand_color is not None else current["brand_color"],
         "logo_base64": logo_base64 if logo_base64 is not None else current["logo_base64"],
         "logo_mime_type": logo_mime_type if logo_mime_type is not None else current["logo_mime_type"],
+        "brand_name": brand_name if brand_name is not None else current["brand_name"],
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     with_retry(lambda: supabase.table("business_profile").upsert(payload, on_conflict="owner_id").execute())
-    return {k: payload[k] for k in ("category", "brand_color", "logo_base64", "logo_mime_type")}
+    return {k: payload[k] for k in ("category", "brand_color", "logo_base64", "logo_mime_type", "brand_name")}
 
 
 @app.get("/business-profile", response_model=BusinessProfileOut, tags=["ads"])
@@ -839,6 +851,7 @@ def set_business_profile(req: SetBusinessProfileRequest, user_id: str = Depends(
             brand_color=req.brand_color,
             logo_base64=req.logo_base64,
             logo_mime_type=req.logo_mime_type,
+            brand_name=req.brand_name,
         )
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
