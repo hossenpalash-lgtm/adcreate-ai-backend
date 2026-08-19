@@ -2701,6 +2701,16 @@ def select_content_plan_post(
 # -----------------------
 # BILLING (Stripe subscriptions)
 # -----------------------
+def _subscription_period_end_iso(sub: dict) -> str:
+    """current_period_end moved off the top-level Subscription object onto
+    each subscription item in recent Stripe API versions (confirmed via a
+    live API response — it's simply absent at the top level now) — every
+    Punqle subscription has exactly one item, so the first is authoritative."""
+    return datetime.fromtimestamp(
+        sub["items"]["data"][0]["current_period_end"], tz=timezone.utc
+    ).isoformat()
+
+
 def _get_subscription_row(user_id: str) -> Optional[dict]:
     res = with_retry(lambda: supabase.table("subscriptions")
         .select("*")
@@ -2804,14 +2814,19 @@ async def stripe_webhook(request: Request):
 
     try:
         event_type = event["type"]
-        data = event["data"]["object"]
+        # .to_dict() — event["data"]["object"] is a typed Stripe object
+        # (e.g. Session, Subscription), not a plain dict, and the SDK
+        # deliberately raises if you call .get() on it (mistaking it for
+        # a real dict method rather than a field named "get"). Converting
+        # once up front lets the rest of this handler use plain .get().
+        data = event["data"]["object"].to_dict()
 
         if event_type == "checkout.session.completed":
             owner_id = data.get("client_reference_id")
             subscription_id = data.get("subscription")
             customer_id = data.get("customer")
             if owner_id and subscription_id and customer_id:
-                sub = stripe.Subscription.retrieve(subscription_id)
+                sub = stripe.Subscription.retrieve(subscription_id).to_dict()
                 price_id = sub["items"]["data"][0]["price"]["id"]
                 tier = PRICE_ID_TO_TIER.get(price_id)
                 with_retry(lambda: supabase.table("subscriptions").upsert({
@@ -2821,9 +2836,7 @@ async def stripe_webhook(request: Request):
                     "price_id": price_id,
                     "tier": tier,
                     "status": sub["status"],
-                    "current_period_end": datetime.fromtimestamp(
-                        sub["current_period_end"], tz=timezone.utc
-                    ).isoformat(),
+                    "current_period_end": _subscription_period_end_iso(sub),
                     "updated_at": "now()",
                 }, on_conflict="owner_id").execute())
 
@@ -2831,14 +2844,17 @@ async def stripe_webhook(request: Request):
             subscription_id = data["id"]
             with_retry(lambda: supabase.table("subscriptions").update({
                 "status": data["status"],
-                "current_period_end": datetime.fromtimestamp(
-                    data["current_period_end"], tz=timezone.utc
-                ).isoformat(),
+                "current_period_end": _subscription_period_end_iso(data),
                 "updated_at": "now()",
             }).eq("stripe_subscription_id", subscription_id).execute())
 
         elif event_type == "invoice.paid":
-            subscription_id = data.get("subscription")
+            # Recent API versions moved this off the top-level "subscription"
+            # field onto parent.subscription_details.subscription — confirmed
+            # via a live Invoice payload (the top-level field is simply gone).
+            parent = data.get("parent") or {}
+            subscription_details = parent.get("subscription_details") or {}
+            subscription_id = subscription_details.get("subscription")
             invoice_id = data.get("id")
             if subscription_id:
                 res = with_retry(lambda: supabase.table("subscriptions")
@@ -2853,7 +2869,7 @@ async def stripe_webhook(request: Request):
                 # fetching the subscription directly so credits still get
                 # granted rather than silently dropped.
                 if not row:
-                    sub = stripe.Subscription.retrieve(subscription_id)
+                    sub = stripe.Subscription.retrieve(subscription_id).to_dict()
                     owner_id = sub["metadata"].get("owner_id")
                     price_id = sub["items"]["data"][0]["price"]["id"]
                     tier = PRICE_ID_TO_TIER.get(price_id)
@@ -2865,9 +2881,7 @@ async def stripe_webhook(request: Request):
                             "price_id": price_id,
                             "tier": tier,
                             "status": sub["status"],
-                            "current_period_end": datetime.fromtimestamp(
-                                sub["current_period_end"], tz=timezone.utc
-                            ).isoformat(),
+                            "current_period_end": _subscription_period_end_iso(sub),
                             "updated_at": "now()",
                         }, on_conflict="owner_id").execute())
                         row = {"owner_id": owner_id, "tier": tier, "last_invoice_id": None}
