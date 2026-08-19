@@ -2737,7 +2737,7 @@ def create_checkout_session(request: Request, req: CheckoutRequest, user_id: str
         return {"checkout_url": session.url}
     except stripe.error.StripeError as e:
         logger.error("Stripe checkout error: %s", str(e), exc_info=True)
-        raise HTTPException(status_code=502, detail="Could not start checkout, please try again.")
+        raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -2780,7 +2780,7 @@ def create_portal_session(request: Request, user_id: str = Depends(get_current_u
         return {"portal_url": session.url}
     except stripe.error.StripeError as e:
         logger.error("Stripe portal error: %s", str(e), exc_info=True)
-        raise HTTPException(status_code=502, detail="Could not open billing portal, please try again.")
+        raise HTTPException(status_code=502, detail=str(e))
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
