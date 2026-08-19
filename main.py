@@ -32,6 +32,7 @@ import io
 import hmac
 import hashlib
 import secrets
+import stripe
 from urllib.parse import urlparse, urlencode
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
@@ -171,6 +172,32 @@ class ReferralStatusOut(BaseModel):
     referral_code: str
     successful_referrals: int
     max_referrals: int
+
+
+class CheckoutRequest(BaseModel):
+    tier: str
+
+    @field_validator("tier")
+    @classmethod
+    def validate_tier(cls, v):
+        if v not in ("starter", "growth", "pro"):
+            raise ValueError("tier must be 'starter', 'growth', or 'pro'")
+        return v
+
+
+class CheckoutResponse(BaseModel):
+    checkout_url: str
+
+
+class PortalResponse(BaseModel):
+    portal_url: str
+
+
+class SubscriptionStatusOut(BaseModel):
+    subscribed: bool
+    tier: Optional[str] = None
+    status: Optional[str] = None
+    current_period_end: Optional[str] = None
 
 
 class GenerateVideoRequest(BaseModel):
@@ -446,6 +473,19 @@ PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()
 SHOPIFY_CLIENT_ID = os.getenv("SHOPIFY_CLIENT_ID", "").strip()
 SHOPIFY_CLIENT_SECRET = os.getenv("SHOPIFY_CLIENT_SECRET", "").strip()
 SHOPIFY_API_VERSION = "2026-07"
+# Optional — subscriptions/checkout are disabled (503) until these are set.
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
+stripe.api_key = STRIPE_SECRET_KEY
+# Maps our own tier names to the Stripe Price object and the monthly
+# credit allotment each successful invoice grants — the Price id is the
+# only thing Stripe needs; everything else here is our own bookkeeping.
+TIER_CONFIG = {
+    "starter": {"price_id": os.getenv("STRIPE_PRICE_STARTER", "").strip(), "credits": 30},
+    "growth": {"price_id": os.getenv("STRIPE_PRICE_GROWTH", "").strip(), "credits": 110},
+    "pro": {"price_id": os.getenv("STRIPE_PRICE_PRO", "").strip(), "credits": 300},
+}
+PRICE_ID_TO_TIER = {cfg["price_id"]: tier for tier, cfg in TIER_CONFIG.items() if cfg["price_id"]}
 # Where the browser lands after completing (or cancelling) the Shopify
 # OAuth flow — reuses the same env var CORS already trusts as "the real
 # frontend," so there's no separate env var to keep in sync.
@@ -2656,3 +2696,195 @@ def select_content_plan_post(
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# -----------------------
+# BILLING (Stripe subscriptions)
+# -----------------------
+def _get_subscription_row(user_id: str) -> Optional[dict]:
+    res = with_retry(lambda: supabase.table("subscriptions")
+        .select("*")
+        .eq("owner_id", user_id)
+        .execute())
+    res = ensure_supabase_response(res, "get subscription")
+    return res.data[0] if res.data else None
+
+
+@app.post("/billing/checkout", response_model=CheckoutResponse, tags=["billing"])
+@limiter.limit("10/minute")
+def create_checkout_session(request: Request, req: CheckoutRequest, user_id: str = Depends(get_current_user_id)):
+    """Creates a Stripe Checkout session for the requested tier and hands
+    back its hosted URL for the frontend to redirect to — actual card
+    entry and 3DS happen on Stripe's own page, never touching our
+    backend, so we never handle card data ourselves. owner_id is stamped
+    onto both the session and the resulting subscription's metadata so
+    the webhook can attribute every event back to a Punqle user without
+    a separate customer-id lookup table."""
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Subscriptions aren't available right now.")
+    price_id = TIER_CONFIG[req.tier]["price_id"]
+    if not price_id:
+        raise HTTPException(status_code=503, detail="This plan isn't available right now.")
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=[{"price": price_id, "quantity": 1}],
+            client_reference_id=user_id,
+            subscription_data={"metadata": {"owner_id": user_id}},
+            success_url=f"{FRONTEND_URL}/?billing=success",
+            cancel_url=f"{FRONTEND_URL}/?billing=cancelled",
+        )
+        return {"checkout_url": session.url}
+    except stripe.error.StripeError as e:
+        logger.error("Stripe checkout error: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=502, detail="Could not start checkout, please try again.")
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/billing/subscription", response_model=SubscriptionStatusOut, tags=["billing"])
+def get_subscription_status(user_id: str = Depends(get_current_user_id)):
+    try:
+        row = _get_subscription_row(user_id)
+        if not row or row["status"] not in ("active", "trialing", "past_due"):
+            return {"subscribed": False}
+        return {
+            "subscribed": True,
+            "tier": row["tier"],
+            "status": row["status"],
+            "current_period_end": row["current_period_end"],
+        }
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/billing/portal", response_model=PortalResponse, tags=["billing"])
+@limiter.limit("10/minute")
+def create_portal_session(request: Request, user_id: str = Depends(get_current_user_id)):
+    """Hands back a link to Stripe's own hosted portal, where the
+    customer can update their card, change plans, or cancel — all
+    self-service on Stripe's side, so we don't need to build any of
+    that UI ourselves."""
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Subscriptions aren't available right now.")
+    row = _get_subscription_row(user_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="No subscription found.")
+    try:
+        session = stripe.billing_portal.Session.create(
+            customer=row["stripe_customer_id"],
+            return_url=f"{FRONTEND_URL}/",
+        )
+        return {"portal_url": session.url}
+    except stripe.error.StripeError as e:
+        logger.error("Stripe portal error: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=502, detail="Could not open billing portal, please try again.")
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/billing/webhook", tags=["billing"])
+async def stripe_webhook(request: Request):
+    """Stripe calls this directly (server-to-server, not from a signed-in
+    browser), so it's verified via Stripe's own signature scheme instead
+    of our Bearer-token auth. Always returns 200 for any event type we
+    recognise but don't act on — returning an error would make Stripe
+    retry an event we were never going to handle differently."""
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=503, detail="Webhook not configured.")
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except (ValueError, stripe.error.SignatureVerificationError):
+        raise HTTPException(status_code=400, detail="Invalid webhook signature.")
+
+    try:
+        event_type = event["type"]
+        data = event["data"]["object"]
+
+        if event_type == "checkout.session.completed":
+            owner_id = data.get("client_reference_id")
+            subscription_id = data.get("subscription")
+            customer_id = data.get("customer")
+            if owner_id and subscription_id and customer_id:
+                sub = stripe.Subscription.retrieve(subscription_id)
+                price_id = sub["items"]["data"][0]["price"]["id"]
+                tier = PRICE_ID_TO_TIER.get(price_id)
+                with_retry(lambda: supabase.table("subscriptions").upsert({
+                    "owner_id": owner_id,
+                    "stripe_customer_id": customer_id,
+                    "stripe_subscription_id": subscription_id,
+                    "price_id": price_id,
+                    "tier": tier,
+                    "status": sub["status"],
+                    "current_period_end": datetime.fromtimestamp(
+                        sub["current_period_end"], tz=timezone.utc
+                    ).isoformat(),
+                    "updated_at": "now()",
+                }, on_conflict="owner_id").execute())
+
+        elif event_type in ("customer.subscription.updated", "customer.subscription.deleted"):
+            subscription_id = data["id"]
+            with_retry(lambda: supabase.table("subscriptions").update({
+                "status": data["status"],
+                "current_period_end": datetime.fromtimestamp(
+                    data["current_period_end"], tz=timezone.utc
+                ).isoformat(),
+                "updated_at": "now()",
+            }).eq("stripe_subscription_id", subscription_id).execute())
+
+        elif event_type == "invoice.paid":
+            subscription_id = data.get("subscription")
+            invoice_id = data.get("id")
+            if subscription_id:
+                res = with_retry(lambda: supabase.table("subscriptions")
+                    .select("*")
+                    .eq("stripe_subscription_id", subscription_id)
+                    .execute())
+                res = ensure_supabase_response(res, "get subscription for invoice")
+                row = res.data[0] if res.data else None
+
+                # Edge case: invoice.paid can arrive before
+                # checkout.session.completed writes the row — fall back to
+                # fetching the subscription directly so credits still get
+                # granted rather than silently dropped.
+                if not row:
+                    sub = stripe.Subscription.retrieve(subscription_id)
+                    owner_id = sub["metadata"].get("owner_id")
+                    price_id = sub["items"]["data"][0]["price"]["id"]
+                    tier = PRICE_ID_TO_TIER.get(price_id)
+                    if owner_id and tier:
+                        with_retry(lambda: supabase.table("subscriptions").upsert({
+                            "owner_id": owner_id,
+                            "stripe_customer_id": sub["customer"],
+                            "stripe_subscription_id": subscription_id,
+                            "price_id": price_id,
+                            "tier": tier,
+                            "status": sub["status"],
+                            "current_period_end": datetime.fromtimestamp(
+                                sub["current_period_end"], tz=timezone.utc
+                            ).isoformat(),
+                            "updated_at": "now()",
+                        }, on_conflict="owner_id").execute())
+                        row = {"owner_id": owner_id, "tier": tier, "last_invoice_id": None}
+
+                # Idempotency: Stripe can redeliver the same event, and
+                # this same invoice can also trigger a retry — only grant
+                # credits once per invoice.
+                if row and row.get("last_invoice_id") != invoice_id and row.get("tier") in TIER_CONFIG:
+                    _add_ad_credits(row["owner_id"], TIER_CONFIG[row["tier"]]["credits"])
+                    with_retry(lambda: supabase.table("subscriptions").update({
+                        "last_invoice_id": invoice_id,
+                        "updated_at": "now()",
+                    }).eq("stripe_subscription_id", subscription_id).execute())
+
+        return {"received": True}
+    except Exception as e:
+        logger.error("Stripe webhook handling error: %s", str(e), exc_info=True)
+        # Still 200 — Stripe retries on non-2xx, and a bug on our side
+        # shouldn't cause the same event to hammer this endpoint forever.
+        return {"received": True, "error": "internal"}
