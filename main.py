@@ -438,6 +438,45 @@ class IdeaLabsResponse(BaseModel):
     ideas: list[str]
 
 
+class UnderstandIdeaRequest(BaseModel):
+    idea_text: str
+
+
+class UnderstandIdeaResponse(BaseModel):
+    content_type: str
+    tone: str
+    visual_direction: str
+    summary_sentence: str
+
+
+CAPTION_TONES = {"professional", "friendly", "bold", "playful", "luxury"}
+CAPTION_LENGTHS = {"short", "medium", "long"}
+
+
+class GenerateCaptionsRequest(BaseModel):
+    item_description: str
+    tone: str = "friendly"
+    length: str = "medium"
+
+    @field_validator("tone")
+    @classmethod
+    def validate_tone(cls, v):
+        if v not in CAPTION_TONES:
+            raise ValueError(f"tone must be one of {sorted(CAPTION_TONES)}")
+        return v
+
+    @field_validator("length")
+    @classmethod
+    def validate_length(cls, v):
+        if v not in CAPTION_LENGTHS:
+            raise ValueError(f"length must be one of {sorted(CAPTION_LENGTHS)}")
+        return v
+
+
+class GenerateCaptionsResponse(BaseModel):
+    captions: list[AdCaptionVariant]
+
+
 class BlogToPostsRequest(BaseModel):
     url: str
 
@@ -1041,6 +1080,123 @@ Respond with ONLY this JSON format, nothing else:
     parsed = json.loads(ai_text_clean)
     tags = parsed.get("hashtags") or []
     return [str(t).lstrip("#").strip() for t in tags if str(t).strip()][:15]
+
+
+def _understand_idea(idea_text: str, category: str) -> dict:
+    """Free — text-only GPT call. Turns a freeform "what do you want to
+    post about" idea into a short, structured read the Social Content
+    wizard shows back as a one-line confirmation before any paid
+    generation happens — the derived content_type also picks which of
+    the 3 visual-direction cards gets marked "Recommended"."""
+    category_guidance = CONTENT_PLAN_CATEGORY_GUIDANCE.get(category, CONTENT_PLAN_CATEGORY_GUIDANCE["other"])
+    prompt = f"""You are helping a small business owner turn a rough idea into a social media post. Read their idea and derive a short understanding of it — don't write the post itself.
+
+{category_guidance}
+
+Their idea: {idea_text}
+
+Derive:
+- "content_type": one short label for what kind of post this is (e.g. "Product launch", "Special offer", "Educational tip", "Customer story", "Behind the scenes", "Announcement")
+- "tone": one short word for the tone this idea calls for (e.g. "warm", "bold", "premium", "playful", "professional")
+- "visual_direction": which single style fits best — must be exactly one of "clean_premium", "bold_energetic", or "warm_lifestyle"
+- "summary_sentence": one short, natural sentence starting with "I'll create..." describing the post you'll make, e.g. "I'll create a product-focused social post with a warm, premium feel."
+
+Respond with ONLY this JSON format, nothing else:
+{{"content_type": "", "tone": "", "visual_direction": "", "summary_sentence": ""}}
+"""
+    response = with_retry(
+        lambda: client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You read a small business owner's rough post idea and derive a short, structured understanding of it."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.4,
+        ),
+        exceptions=RETRYABLE_OPENAI_ERRORS,
+    )
+    ai_text = response.choices[0].message.content.strip()
+    m = re.search(r"```(?:json)?\n(.*?)```", ai_text, re.S)
+    ai_text_clean = m.group(1).strip() if m else ai_text.strip().strip("`").strip()
+    parsed = json.loads(ai_text_clean)
+    visual_direction = parsed.get("visual_direction") or "clean_premium"
+    if visual_direction not in {"clean_premium", "bold_energetic", "warm_lifestyle"}:
+        visual_direction = "clean_premium"
+    return {
+        "content_type": parsed.get("content_type") or "Announcement",
+        "tone": parsed.get("tone") or "warm",
+        "visual_direction": visual_direction,
+        "summary_sentence": parsed.get("summary_sentence") or "I'll create a social post for your business.",
+    }
+
+
+CAPTION_TONE_GUIDANCE = {
+    "professional": "Professional and polished — clear, credible, no slang or emoji overload.",
+    "friendly": "Friendly and approachable — warm, conversational, like talking to a regular customer.",
+    "bold": "Bold and confident — punchy, direct, energetic language.",
+    "playful": "Playful and fun — light humor, casual tone, upbeat emoji use where natural.",
+    "luxury": "Luxury and premium — refined, understated, no exclamation-heavy hype language.",
+}
+
+CAPTION_LENGTH_GUIDANCE = {
+    "short": "Very short — 1 line, under 12 words.",
+    "medium": "Medium length — 2-3 lines.",
+    "long": "Longer — 4-5 lines with more detail.",
+}
+
+
+def _generate_captions_with_style(item_description: str, category: str, tone: str, length: str) -> list[dict]:
+    """Free — text-only GPT call, same economics as translate-captions and
+    suggest-hashtags. Deliberately separate from _generate_ad_copy (which
+    is bundled into the paid /ads/generate image call) so tone/length
+    caption regeneration in the Post Kit ("Generate another") never
+    spends a credit or re-generates the image."""
+    category_guidance = CONTENT_PLAN_CATEGORY_GUIDANCE.get(category, CONTENT_PLAN_CATEGORY_GUIDANCE["other"])
+    tone_guidance = CAPTION_TONE_GUIDANCE.get(tone, CAPTION_TONE_GUIDANCE["friendly"])
+    length_guidance = CAPTION_LENGTH_GUIDANCE.get(length, CAPTION_LENGTH_GUIDANCE["medium"])
+    prompt = f"""You are a Facebook ad copywriter for small businesses.
+
+{category_guidance}
+
+Tone: {tone_guidance}
+Length: {length_guidance}
+
+From the product/offer description below, write 3 distinct caption options in this same tone and length — each with a genuinely different angle or opening line, not just reworded.
+
+Each version has two parts:
+1. "facebook_caption" — the Facebook post caption, matching the tone/length above, emoji only where the tone calls for it
+2. "whatsapp_message" — an even shorter WhatsApp message version (1-2 lines, for sending directly to a customer)
+
+Keep any numbers/prices exactly as given — don't invent new prices or offers.
+
+Product/offer description: {item_description}
+
+Respond with ONLY this JSON format, nothing else:
+{{"captions": [{{"facebook_caption": "", "whatsapp_message": ""}}, {{"facebook_caption": "", "whatsapp_message": ""}}, {{"facebook_caption": "", "whatsapp_message": ""}}]}}
+"""
+    response = with_retry(
+        lambda: client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You write short, appealing marketing copy for small business owners."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.8,
+        ),
+        exceptions=RETRYABLE_OPENAI_ERRORS,
+    )
+    ai_text = response.choices[0].message.content.strip()
+    m = re.search(r"```(?:json)?\n(.*?)```", ai_text, re.S)
+    ai_text_clean = m.group(1).strip() if m else ai_text.strip().strip("`").strip()
+    parsed = json.loads(ai_text_clean)
+    captions = parsed.get("captions") or []
+    return [
+        {
+            "facebook_caption": c.get("facebook_caption", ""),
+            "whatsapp_message": c.get("whatsapp_message", ""),
+        }
+        for c in captions[:3]
+    ] or [{"facebook_caption": "", "whatsapp_message": ""}]
 
 
 def _generate_idea_labs_ideas(category: str) -> list[str]:
@@ -2044,6 +2200,54 @@ def suggest_hashtags(
         category = _get_business_category(user_id)
         hashtags = _suggest_hashtags(text, category)
         return {"hashtags": hashtags}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/understand-idea", response_model=UnderstandIdeaResponse, tags=["ads"])
+@limiter.limit("15/minute")
+def understand_idea(
+    request: Request,
+    req: UnderstandIdeaRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Free — text-only GPT call. Powers the Social Content wizard's
+    "Got it — I'll create..." confirmation step, run before any paid
+    generation."""
+    try:
+        text = (req.idea_text or "").strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="Tell us what you want to post about first.")
+        category = _get_business_category(user_id)
+        return _understand_idea(text, category)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ads/generate-captions", response_model=GenerateCaptionsResponse, tags=["ads"])
+@limiter.limit("15/minute")
+def generate_captions(
+    request: Request,
+    req: GenerateCaptionsRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Free — text-only GPT call, same economics as suggest-hashtags.
+    Powers the Post Kit's tone/length caption controls and "Generate
+    another" — deliberately not part of /ads/generate so it never spends
+    a credit or touches the already-generated image."""
+    try:
+        text = (req.item_description or "").strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="Tell us what the post is about first.")
+        category = _get_business_category(user_id)
+        captions = _generate_captions_with_style(text, category, req.tone, req.length)
+        return {"captions": captions}
     except HTTPException:
         raise
     except Exception as e:
