@@ -446,6 +446,8 @@ class UnderstandIdeaResponse(BaseModel):
     content_type: str
     tone: str
     visual_direction: str
+    visual_subject: str
+    offer: str
     summary_sentence: str
 
 
@@ -1087,7 +1089,17 @@ def _understand_idea(idea_text: str, category: str) -> dict:
     post about" idea into a short, structured read the Social Content
     wizard shows back as a one-line confirmation before any paid
     generation happens — the derived content_type also picks which of
-    the 3 visual-direction cards gets marked "Recommended"."""
+    the 3 visual-direction cards gets marked "Recommended".
+
+    Also derives `visual_subject`/`offer` — real semantic subject/entity
+    extraction for the Step 2 style-preview image search
+    (VisualDirectionStep.tsx), reusing this SAME already-free call rather
+    than guessing the subject with a client-side regex heuristic (the
+    prior approach, which could invent a subject out of noisy leftover
+    text). Deliberately allowed to come back empty — a genuinely
+    subject-less idea ("Create a promotional post for my special offer")
+    must not have a subject hallucinated for it; the frontend falls back
+    to a neutral, non-specific query when it's empty."""
     category_guidance = CONTENT_PLAN_CATEGORY_GUIDANCE.get(category, CONTENT_PLAN_CATEGORY_GUIDANCE["other"])
     prompt = f"""You are helping a small business owner turn a rough idea into a social media post. Read their idea and derive a short understanding of it — don't write the post itself.
 
@@ -1099,16 +1111,26 @@ Derive:
 - "content_type": one short label for what kind of post this is (e.g. "Product launch", "Special offer", "Educational tip", "Customer story", "Behind the scenes", "Announcement")
 - "tone": one short word for the tone this idea calls for (e.g. "warm", "bold", "premium", "playful", "professional")
 - "visual_direction": which single style fits best — must be exactly one of "clean_premium", "bold_energetic", or "warm_lifestyle"
+- "visual_subject": a short 2-5 word noun phrase naming a real, searchable visual scene this post is actually about — a product, service setting, object, place, or general (not-a-specific-individual) person/activity. This can be broader than a literal product: a service business still has a real visual world (e.g. "online accounting service" -> "accountant office laptop"; "our fitness program" -> "person exercising gym"), and a customer story about a person's journey still has a real visual scene even with no product named (e.g. "customer story about someone losing weight" -> "fitness transformation person" — a general scene, NEVER a specific named individual's likeness, age, ethnicity, or exact appearance, since none of that was given). Only return an EMPTY STRING when the idea is truly about nothing visual at all — e.g. "Create a promotional post for my special offer", "Announce our new update", "Create something professional" have no product, no service activity, no place, no person, nothing to picture. Don't default to empty just because there's no literal product noun — ask "is there a real scene I could photograph here?" first.
+- "offer": a short offer/CTA phrase if their idea states one (e.g. "20% off", "free consultation", "special offer", "this weekend only") — otherwise an empty string.
 - "summary_sentence": one short, natural sentence starting with "I'll create..." describing the post you'll make, e.g. "I'll create a product-focused social post with a warm, premium feel."
 
+Examples:
+"Create a promotional post for my special offer." -> visual_subject: "" (nothing visual stated at all)
+"20% off our premium coffee beans this weekend." -> visual_subject: "coffee beans", offer: "20% off"
+"Announce our new online accounting service." -> visual_subject: "accountant office desk" (a service still has a real setting)
+"Share a customer story about how our fitness program helped someone lose weight." -> visual_subject: "person exercising gym" (a general activity scene, not a specific person)
+"New summer collection for our fashion store." -> visual_subject: "summer clothing collection"
+"Create an announcement for our company." -> visual_subject: "" (no industry, product, or setting given — don't invent one)
+
 Respond with ONLY this JSON format, nothing else:
-{{"content_type": "", "tone": "", "visual_direction": "", "summary_sentence": ""}}
+{{"content_type": "", "tone": "", "visual_direction": "", "visual_subject": "", "offer": "", "summary_sentence": ""}}
 """
     response = with_retry(
         lambda: client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You read a small business owner's rough post idea and derive a short, structured understanding of it."},
+                {"role": "system", "content": "You read a small business owner's rough post idea and derive a short, structured understanding of it. You never invent details — product names, subjects, or offers — that aren't actually present in their words."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.4,
@@ -1126,6 +1148,8 @@ Respond with ONLY this JSON format, nothing else:
         "content_type": parsed.get("content_type") or "Announcement",
         "tone": parsed.get("tone") or "warm",
         "visual_direction": visual_direction,
+        "visual_subject": (parsed.get("visual_subject") or "").strip(),
+        "offer": (parsed.get("offer") or "").strip(),
         "summary_sentence": parsed.get("summary_sentence") or "I'll create a social post for your business.",
     }
 
