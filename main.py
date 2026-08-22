@@ -2732,11 +2732,13 @@ def get_meta_connect_url(user_id: str = Depends(get_current_user_id)):
         "client_id": META_APP_ID,
         "redirect_uri": f"{BACKEND_URL}/meta/callback",
         "state": state,
-        # pages_read_engagement deliberately excluded — nothing in this app
-        # reads Page posts/followers/engagement data, only lists Pages and
-        # posts to them, so requesting it would be an unused permission
-        # (App Review checks for exactly this).
-        "scope": "pages_show_list,pages_manage_posts,instagram_basic,instagram_content_publish",
+        # pages_read_engagement is required by Meta as a mandatory companion
+        # to pages_manage_posts (confirmed directly in the App Review
+        # submission flow, not just assumed) — a submission for
+        # pages_manage_posts is rejected without it, regardless of whether
+        # the app has a separate feature that independently reads engagement
+        # data.
+        "scope": "pages_show_list,pages_read_engagement,pages_manage_posts,instagram_basic,instagram_content_publish",
     }
     return {"authorize_url": f"https://www.facebook.com/{META_GRAPH_VERSION}/dialog/oauth?{urlencode(params)}"}
 
