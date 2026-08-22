@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, field_validator
 from openai import OpenAI, APIConnectionError, APITimeoutError, RateLimitError
 from google import genai
@@ -268,6 +268,49 @@ class ShopifyStatusResponse(BaseModel):
     shop_domain: Optional[str] = None
 
 
+class MetaConnectUrlResponse(BaseModel):
+    authorize_url: str
+
+
+class MetaStatusResponse(BaseModel):
+    connected: bool
+    page_name: Optional[str] = None
+    ig_username: Optional[str] = None
+
+
+class MetaAvailablePage(BaseModel):
+    page_id: str
+    page_name: str
+    has_instagram: bool
+    ig_username: Optional[str] = None
+
+
+class MetaAvailablePagesResponse(BaseModel):
+    pages: list[MetaAvailablePage]
+
+
+class MetaSelectPageRequest(BaseModel):
+    page_id: str
+
+
+class MetaSelectPageResponse(BaseModel):
+    connected: bool
+    page_name: str
+    ig_username: Optional[str] = None
+
+
+class MetaPlatformResult(BaseModel):
+    posted: bool
+    post_id: Optional[str] = None
+    media_id: Optional[str] = None
+    error: Optional[str] = None
+
+
+class MetaPublishResponse(BaseModel):
+    facebook: Optional[MetaPlatformResult] = None
+    instagram: Optional[MetaPlatformResult] = None
+
+
 class AdCaptionVariant(BaseModel):
     facebook_caption: str
     whatsapp_message: str
@@ -514,6 +557,11 @@ PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()
 SHOPIFY_CLIENT_ID = os.getenv("SHOPIFY_CLIENT_ID", "").strip()
 SHOPIFY_CLIENT_SECRET = os.getenv("SHOPIFY_CLIENT_SECRET", "").strip()
 SHOPIFY_API_VERSION = "2026-07"
+# Optional — only Facebook/Instagram connect+publish needs these.
+META_APP_ID = os.getenv("META_APP_ID", "").strip()
+META_APP_SECRET = os.getenv("META_APP_SECRET", "").strip()
+META_GRAPH_VERSION = "v21.0"
+META_GRAPH_URL = f"https://graph.facebook.com/{META_GRAPH_VERSION}"
 # Optional — subscriptions/checkout are disabled (503) until these are set.
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
@@ -1603,6 +1651,68 @@ def _fetch_shopify_products(shop_domain: str, access_token: str) -> list[dict]:
     return products
 
 
+_META_STATE_SEP = "."
+
+
+def _sign_meta_state(user_id: str) -> str:
+    """Same purpose/shape as _sign_shopify_state — ties the OAuth state
+    param to a specific Punqle user, since the redirect back from
+    Facebook is a plain browser navigation and can't carry our normal
+    Bearer auth header."""
+    nonce = secrets.token_urlsafe(16)
+    payload = f"{user_id}{_META_STATE_SEP}{nonce}"
+    signature = hmac.new(META_APP_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}{_META_STATE_SEP}{signature}"
+
+
+def _verify_meta_state(state: str) -> str:
+    parts = (state or "").split(_META_STATE_SEP)
+    if len(parts) != 3:
+        raise HTTPException(status_code=400, detail="Invalid or expired connection request.")
+    user_id, nonce, signature = parts
+    payload = f"{user_id}{_META_STATE_SEP}{nonce}"
+    expected = hmac.new(META_APP_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        raise HTTPException(status_code=400, detail="Invalid or expired connection request.")
+    return user_id
+
+
+# Short-lived relay so Instagram's Content Publishing API (which only
+# accepts a fetchable image_url, never a direct file upload) can pull the
+# just-generated image from us. In-memory, not a DB table or storage
+# bucket — deliberate: the image only needs to survive the few seconds
+# Meta's own fetch takes, and this deployment runs uvicorn single-process
+# (no --workers), so a plain dict is safe here. If --workers is ever
+# added to the start command, this must move to a DB row instead — an
+# in-memory dict would then miss requests routed to a different worker.
+_TEMP_IMAGE_TTL_SECONDS = 300
+_TEMP_IMAGES: dict[str, tuple[bytes, str, float]] = {}
+
+
+def _register_temp_image(image_bytes: bytes, mime_type: str) -> str:
+    token = secrets.token_urlsafe(32)
+    _TEMP_IMAGES[token] = (image_bytes, mime_type, time.time() + _TEMP_IMAGE_TTL_SECONDS)
+    return token
+
+
+def _pop_temp_image(token: str) -> Optional[tuple[bytes, str]]:
+    entry = _TEMP_IMAGES.pop(token, None)
+    if not entry:
+        return None
+    image_bytes, mime_type, expires_at = entry
+    if time.time() > expires_at:
+        return None
+    return image_bytes, mime_type
+
+
+def _meta_graph_error_message(resp: requests.Response) -> tuple[str, Optional[int]]:
+    try:
+        err = resp.json().get("error", {})
+        return err.get("message") or "Meta returned an error.", err.get("code")
+    except Exception:
+        return "Meta returned an error.", None
+
+
 _MAX_ARTICLE_CHARS = 6000  # plenty for GPT to find several distinct angles without blowing up the prompt
 
 
@@ -2605,6 +2715,386 @@ def sync_shopify_products(request: Request, user_id: str = Depends(get_current_u
     except Exception as e:
         logger.error("ERROR: %s", str(e), exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/meta/connect-url", response_model=MetaConnectUrlResponse, tags=["meta"])
+def get_meta_connect_url(user_id: str = Depends(get_current_user_id)):
+    """Returns the Facebook OAuth dialog URL for the frontend to
+    navigate the browser to directly — generated via an authenticated
+    call specifically so the signed state param can be tied to this
+    user, since the subsequent browser redirect to and from Facebook
+    can't carry that header itself. Unlike Shopify's connect-url, there's
+    no user-supplied input (no shop domain equivalent), so this is a GET."""
+    if not META_APP_ID or not META_APP_SECRET:
+        raise HTTPException(status_code=503, detail="Connecting Facebook/Instagram isn't available right now.")
+    state = _sign_meta_state(user_id)
+    params = {
+        "client_id": META_APP_ID,
+        "redirect_uri": f"{BACKEND_URL}/meta/callback",
+        "state": state,
+        "scope": "pages_show_list,pages_read_engagement,pages_manage_posts,instagram_basic,instagram_content_publish",
+    }
+    return {"authorize_url": f"https://www.facebook.com/{META_GRAPH_VERSION}/dialog/oauth?{urlencode(params)}"}
+
+
+@app.get("/meta/callback", tags=["meta"])
+def meta_oauth_callback(request: Request):
+    """Facebook redirects the business owner's browser here after they
+    approve (or decline) the connection — a plain GET navigation, not an
+    authenticated API call, so this route trusts our own signed state
+    param instead of a Bearer token (same shape as /shopify/callback)."""
+    try:
+        params = dict(request.query_params)
+        if not META_APP_ID or not META_APP_SECRET:
+            return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
+        error = params.get("error")
+        code = params.get("code", "")
+        if error or not code:
+            return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
+
+        user_id = _verify_meta_state(params.get("state", ""))
+        redirect_uri = f"{BACKEND_URL}/meta/callback"
+
+        token_resp = with_retry(
+            lambda: requests.get(
+                f"{META_GRAPH_URL}/oauth/access_token",
+                params={
+                    "client_id": META_APP_ID,
+                    "redirect_uri": redirect_uri,
+                    "client_secret": META_APP_SECRET,
+                    "code": code,
+                },
+                timeout=15,
+            ),
+            exceptions=(requests.RequestException,),
+            attempts=2,
+        )
+        if not token_resp.ok:
+            logger.error("Meta code exchange failed: %s", token_resp.text)
+            return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
+        short_lived_token = token_resp.json().get("access_token")
+        if not short_lived_token:
+            return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
+
+        # Exchange for a long-lived user token (~60 days) — Page tokens
+        # derived from it don't expire on their own barring revocation
+        # or the user changing their Facebook password.
+        long_resp = with_retry(
+            lambda: requests.get(
+                f"{META_GRAPH_URL}/oauth/access_token",
+                params={
+                    "grant_type": "fb_exchange_token",
+                    "client_id": META_APP_ID,
+                    "client_secret": META_APP_SECRET,
+                    "fb_exchange_token": short_lived_token,
+                },
+                timeout=15,
+            ),
+            exceptions=(requests.RequestException,),
+            attempts=2,
+        )
+        if not long_resp.ok:
+            logger.error("Meta long-lived token exchange failed: %s", long_resp.text)
+            return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
+        user_token = long_resp.json().get("access_token")
+        if not user_token:
+            return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
+
+        pages_resp = with_retry(
+            lambda: requests.get(
+                f"{META_GRAPH_URL}/me/accounts",
+                params={
+                    "fields": "id,name,access_token,instagram_business_account{id,username}",
+                    "access_token": user_token,
+                },
+                timeout=15,
+            ),
+            exceptions=(requests.RequestException,),
+            attempts=2,
+        )
+        if not pages_resp.ok:
+            logger.error("Meta /me/accounts failed: %s", pages_resp.text)
+            return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
+        raw_pages = pages_resp.json().get("data", [])
+        if not raw_pages:
+            return RedirectResponse(f"{FRONTEND_URL}/?meta=error&reason=no_pages")
+
+        pages = []
+        for p in raw_pages:
+            ig = p.get("instagram_business_account")
+            pages.append({
+                "page_id": p["id"],
+                "page_name": p.get("name", ""),
+                "page_access_token": p.get("access_token", ""),
+                "ig_user_id": ig.get("id") if ig else None,
+                "ig_username": ig.get("username") if ig else None,
+            })
+
+        if len(pages) == 1:
+            page = pages[0]
+            with_retry(lambda: supabase.table("meta_connections").upsert({
+                "owner_id": user_id,
+                "page_id": page["page_id"],
+                "page_name": page["page_name"],
+                "page_access_token": page["page_access_token"],
+                "ig_user_id": page["ig_user_id"],
+                "ig_username": page["ig_username"],
+                "connected_at": datetime.now(timezone.utc).isoformat(),
+            }, on_conflict="owner_id").execute())
+            return RedirectResponse(f"{FRONTEND_URL}/?meta=connected")
+
+        with_retry(lambda: supabase.table("meta_pending_connections").upsert({
+            "owner_id": user_id,
+            "pages": pages,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="owner_id").execute())
+        return RedirectResponse(f"{FRONTEND_URL}/?meta=pick-page")
+    except HTTPException:
+        return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
+    except requests.RequestException:
+        return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        return RedirectResponse(f"{FRONTEND_URL}/?meta=error")
+
+
+@app.get("/meta/available-pages", response_model=MetaAvailablePagesResponse, tags=["meta"])
+def get_meta_available_pages(user_id: str = Depends(get_current_user_id)):
+    """Reads the Pages found during /meta/callback for a user who manages
+    more than one — never returns the page_access_token to the client."""
+    try:
+        res = with_retry(lambda: supabase.table("meta_pending_connections")
+            .select("pages")
+            .eq("owner_id", user_id)
+            .execute())
+        res = ensure_supabase_response(res, "get meta pending pages")
+        if not res.data:
+            raise HTTPException(status_code=400, detail="No pending connection found — please reconnect.")
+        pages = res.data[0]["pages"]
+        return {"pages": [
+            {
+                "page_id": p["page_id"],
+                "page_name": p["page_name"],
+                "has_instagram": bool(p.get("ig_user_id")),
+                "ig_username": p.get("ig_username"),
+            }
+            for p in pages
+        ]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/meta/select-page", response_model=MetaSelectPageResponse, tags=["meta"])
+def select_meta_page(req: MetaSelectPageRequest, user_id: str = Depends(get_current_user_id)):
+    try:
+        res = with_retry(lambda: supabase.table("meta_pending_connections")
+            .select("pages")
+            .eq("owner_id", user_id)
+            .execute())
+        res = ensure_supabase_response(res, "get meta pending pages")
+        if not res.data:
+            raise HTTPException(status_code=400, detail="No pending connection found — please reconnect.")
+        pages = res.data[0]["pages"]
+        page = next((p for p in pages if p["page_id"] == req.page_id), None)
+        if not page:
+            raise HTTPException(status_code=400, detail="That Page wasn't in your list — please reconnect.")
+
+        with_retry(lambda: supabase.table("meta_connections").upsert({
+            "owner_id": user_id,
+            "page_id": page["page_id"],
+            "page_name": page["page_name"],
+            "page_access_token": page["page_access_token"],
+            "ig_user_id": page["ig_user_id"],
+            "ig_username": page["ig_username"],
+            "connected_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="owner_id").execute())
+        supabase.table("meta_pending_connections").delete().eq("owner_id", user_id).execute()
+        return {"connected": True, "page_name": page["page_name"], "ig_username": page["ig_username"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/meta/status", response_model=MetaStatusResponse, tags=["meta"])
+def get_meta_status(user_id: str = Depends(get_current_user_id)):
+    try:
+        res = with_retry(lambda: supabase.table("meta_connections")
+            .select("page_name, ig_username")
+            .eq("owner_id", user_id)
+            .execute())
+        res = ensure_supabase_response(res, "get meta connection status")
+        if res.data:
+            return {"connected": True, "page_name": res.data[0]["page_name"], "ig_username": res.data[0]["ig_username"]}
+        return {"connected": False, "page_name": None, "ig_username": None}
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/meta/disconnect", tags=["meta"])
+def disconnect_meta(user_id: str = Depends(get_current_user_id)):
+    try:
+        supabase.table("meta_connections").delete().eq("owner_id", user_id).execute()
+        supabase.table("meta_pending_connections").delete().eq("owner_id", user_id).execute()
+        return {"disconnected": True}
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/meta/temp-image/{token}", tags=["meta"])
+def get_meta_temp_image(token: str):
+    """Public, unauthenticated — Meta's own crawler fetches this while
+    building an Instagram media container, and can't send a Bearer
+    header. Pop-on-first-fetch plus a short TTL (see _TEMP_IMAGES) keeps
+    the exposure window tiny despite this necessarily being open."""
+    entry = _pop_temp_image(token)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Image not found or expired.")
+    image_bytes, mime_type = entry
+    return Response(content=image_bytes, media_type=mime_type)
+
+
+@app.post("/meta/publish", response_model=MetaPublishResponse, tags=["meta"])
+@limiter.limit("10/minute")
+def publish_to_meta(
+    request: Request,
+    file: UploadFile = File(...),
+    caption: str = Form(...),
+    post_to_facebook: bool = Form(...),
+    post_to_instagram: bool = Form(...),
+    user_id: str = Depends(get_current_user_id),
+):
+    """Publishes an already-generated (already-paid-for) image straight
+    to the business's connected Facebook Page and/or Instagram account —
+    no credit is spent here, same "free packaging" principle as the
+    Carousel Builder's ZIP download. Facebook and Instagram are
+    independent Graph API calls with no shared rollback, so a partial
+    success (one platform posts, the other fails) is surfaced rather
+    than hidden or rolled back."""
+    if not post_to_facebook and not post_to_instagram:
+        raise HTTPException(status_code=400, detail="Choose at least one platform to post to.")
+    try:
+        res = with_retry(lambda: supabase.table("meta_connections")
+            .select("page_id, page_access_token, ig_user_id")
+            .eq("owner_id", user_id)
+            .execute())
+        res = ensure_supabase_response(res, "get meta connection")
+        if not res.data:
+            raise HTTPException(status_code=400, detail="Connect Facebook/Instagram first.")
+        connection = res.data[0]
+        if post_to_instagram and not connection.get("ig_user_id"):
+            raise HTTPException(status_code=400, detail="This Page has no linked Instagram account.")
+
+        image_bytes = file.file.read()
+        mime_type = file.content_type or "image/jpeg"
+
+        result: dict = {}
+
+        if post_to_facebook:
+            result["facebook"] = _publish_to_facebook_page(
+                connection["page_id"], connection["page_access_token"], image_bytes, mime_type, caption, user_id,
+            )
+
+        if post_to_instagram:
+            result["instagram"] = _publish_to_instagram(
+                connection["ig_user_id"], connection["page_access_token"], image_bytes, mime_type, caption,
+            )
+
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ERROR: %s", str(e), exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _disconnect_meta_on_expired_token(user_id: str) -> None:
+    try:
+        supabase.table("meta_connections").delete().eq("owner_id", user_id).execute()
+    except Exception:
+        pass
+
+
+def _publish_to_facebook_page(page_id: str, page_access_token: str, image_bytes: bytes, mime_type: str, caption: str, user_id: str) -> dict:
+    try:
+        resp = with_retry(
+            lambda: requests.post(
+                f"{META_GRAPH_URL}/{page_id}/photos",
+                data={"caption": caption, "access_token": page_access_token},
+                files={"source": ("image.jpg", image_bytes, mime_type)},
+                timeout=30,
+            ),
+            exceptions=(requests.RequestException,),
+            attempts=2,
+        )
+        if resp.ok:
+            data = resp.json()
+            return {"posted": True, "post_id": data.get("post_id") or data.get("id")}
+        message, code = _meta_graph_error_message(resp)
+        if code == 190:
+            _disconnect_meta_on_expired_token(user_id)
+            return {"posted": False, "error": "Your Meta connection expired — please reconnect."}
+        return {"posted": False, "error": message}
+    except requests.RequestException:
+        return {"posted": False, "error": "Couldn't reach Facebook. Please try again."}
+
+
+def _publish_to_instagram(ig_user_id: str, page_access_token: str, image_bytes: bytes, mime_type: str, caption: str) -> dict:
+    token = _register_temp_image(image_bytes, mime_type)
+    try:
+        create_resp = with_retry(
+            lambda: requests.post(
+                f"{META_GRAPH_URL}/{ig_user_id}/media",
+                data={
+                    "image_url": f"{BACKEND_URL}/meta/temp-image/{token}",
+                    "caption": caption,
+                    "access_token": page_access_token,
+                },
+                timeout=30,
+            ),
+            exceptions=(requests.RequestException,),
+            attempts=2,
+        )
+        if not create_resp.ok:
+            message, _code = _meta_graph_error_message(create_resp)
+            return {"posted": False, "error": message}
+        creation_id = create_resp.json().get("id")
+        if not creation_id:
+            return {"posted": False, "error": "Instagram didn't accept the image."}
+
+        for _ in range(6):
+            status_resp = requests.get(
+                f"{META_GRAPH_URL}/{creation_id}",
+                params={"fields": "status_code", "access_token": page_access_token},
+                timeout=15,
+            )
+            if status_resp.ok and status_resp.json().get("status_code") == "FINISHED":
+                break
+            time.sleep(2)
+
+        publish_resp = with_retry(
+            lambda: requests.post(
+                f"{META_GRAPH_URL}/{ig_user_id}/media_publish",
+                data={"creation_id": creation_id, "access_token": page_access_token},
+                timeout=30,
+            ),
+            exceptions=(requests.RequestException,),
+            attempts=2,
+        )
+        if publish_resp.ok:
+            return {"posted": True, "media_id": publish_resp.json().get("id")}
+        message, _code = _meta_graph_error_message(publish_resp)
+        return {"posted": False, "error": message}
+    except requests.RequestException:
+        return {"posted": False, "error": "Couldn't reach Instagram. Please try again."}
+    finally:
+        _pop_temp_image(token)
 
 
 @app.post("/ads/blog-to-posts", response_model=BlogToPostsResponse, tags=["ads"])
