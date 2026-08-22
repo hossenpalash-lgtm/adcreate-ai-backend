@@ -1108,7 +1108,7 @@ def _understand_idea(idea_text: str, category: str) -> dict:
 Their idea: {idea_text}
 
 Derive:
-- "content_type": one short label for what kind of post this is (e.g. "Product launch", "Special offer", "Educational tip", "Customer story", "Behind the scenes", "Announcement")
+- "content_type": one short label for what kind of post this is (e.g. "Product launch", "Special offer", "Educational tip", "Customer story", "Behind the scenes", "Announcement"). If the idea explicitly names or clearly matches one of these more specific engagement formats, use that EXACT format name instead of a broader category — never generalize one of these into "Educational tip" or anything else: "Poll", "Question", "This or That", "Myth vs Fact", "Fun Fact", "Quote", "Quick Tip", "Checklist", "Before & After", "Did You Know", "Industry Insight", "Conversation Starter", "Mini Story".
 - "tone": one short word for the tone this idea calls for (e.g. "warm", "bold", "premium", "playful", "professional")
 - "visual_direction": which single style fits best — must be exactly one of "clean_premium", "bold_energetic", or "warm_lifestyle"
 - "visual_subject": a short 2-5 word noun phrase naming a real, searchable visual scene this post is actually about — a product, service setting, object, place, or general (not-a-specific-individual) person/activity. Fill this in ONLY when the idea states or clearly implies something concrete beyond the bare content type — a named product, a described service, a specific activity or detail. This can be broader than a literal product: a service business still has a real visual world when the service itself is named (e.g. "online accounting service" -> "accountant office laptop"; "our fitness program" -> "person exercising gym"), and a customer story still has a real visual scene when a real outcome is described (e.g. "customer story about someone losing weight" -> "fitness transformation person" — a general scene, NEVER a specific named individual's likeness, age, ethnicity, or exact appearance, since none of that was given). Return an EMPTY STRING whenever the idea is just the bare content type with nothing further said — no product, service, activity, place, or detail actually named. This includes short generic prompts like "Create a promotional post for my special offer", "Announce our new update", "Create something professional", but ALSO longer ones that only restate the category with no real content added, e.g. "Create an educational post explaining", "Create a behind-the-scenes post about", "Create a customer story post about", "Create a product launch post for my business" — none of these name an actual topic, activity, or product, so none of them get a visual_subject. Never invent a plausible-sounding specific (like "checklist", "office team collaboration", "client consultation", "workspace activity", "educational materials") just because it sounds like it could fit the category — only extract, never guess.
@@ -1249,6 +1249,56 @@ Respond with ONLY this JSON format, nothing else:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.8,
+        ),
+        exceptions=RETRYABLE_OPENAI_ERRORS,
+    )
+    ai_text = response.choices[0].message.content.strip()
+    m = re.search(r"```(?:json)?\n(.*?)```", ai_text, re.S)
+    ai_text_clean = m.group(1).strip() if m else ai_text.strip().strip("`").strip()
+    parsed = json.loads(ai_text_clean)
+    ideas = parsed.get("ideas") or []
+    return [str(i).strip() for i in ideas if str(i).strip()][:10]
+
+
+SURPRISE_FORMATS = [
+    "Poll", "Question", "This or That", "Myth vs Fact", "Fun Fact", "Quote",
+    "Quick Tip", "Checklist", "Before & After", "Did You Know",
+    "Industry Insight", "Conversation Starter", "Mini Story",
+]
+
+
+def _generate_surprise_ideas(category: str) -> list[str]:
+    """Free — text-only GPT call, powers Step 1's "Surprise me" button
+    specifically. Deliberately a SEPARATE prompt from
+    _generate_idea_labs_ideas (still used unchanged by the Idea
+    Inspiration panel) — Surprise Me needs to stay clear of the 6
+    existing Popular Idea chip categories (Product launch, Special
+    offer, Educational, Customer story, Behind the scenes, Announcement)
+    since suggesting one of those is just a re-roll of a chip the user
+    can already click directly, not a genuinely different concept."""
+    category_guidance = CONTENT_PLAN_CATEGORY_GUIDANCE.get(category, CONTENT_PLAN_CATEGORY_GUIDANCE["other"])
+    formats = ", ".join(SURPRISE_FORMATS)
+    prompt = f"""You are a social media content strategist for a small business.
+
+{category_guidance}
+
+Suggest 8 distinct, concrete social media post ideas. Each idea MUST be built around exactly one of these engagement formats: {formats}.
+
+Do NOT suggest a product launch, a special offer/promo/discount, a generic educational tip/how-to, a customer story/testimonial, a behind-the-scenes post, or a business announcement — those are already covered by other options and would just repeat one of them. Every idea here must be a genuinely different content format from that list.
+
+Start each idea by naming its format so it's unambiguous, e.g. "Poll: ask your followers whether they prefer X or Y", "This or That: two of your products side by side, let people vote", "Myth vs Fact: bust a common misconception in your industry". Don't invent fake stats, prices, or specific products you can't know about — keep ideas general enough to apply, but concrete.
+
+Respond with ONLY this JSON format, nothing else:
+{{"ideas": ["idea 1", "idea 2"]}}
+"""
+    response = with_retry(
+        lambda: client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You give small business owners fresh, engagement-focused social media post ideas that are genuinely different from generic product/offer/educational posts."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.9,
         ),
         exceptions=RETRYABLE_OPENAI_ERRORS,
     )
@@ -2285,13 +2335,16 @@ def generate_captions(
 
 @app.get("/ads/idea-labs", response_model=IdeaLabsResponse, tags=["ads"])
 @limiter.limit("10/minute")
-def idea_labs(request: Request, user_id: str = Depends(get_current_user_id)):
+def idea_labs(request: Request, mode: str = "general", user_id: str = Depends(get_current_user_id)):
     """Free — text-only GPT call. General post inspiration for a user
     with no specific product typed in yet, grounded only in their saved
-    business category."""
+    business category. mode="surprise" (Step 1's "Surprise me" button
+    only) swaps in _generate_surprise_ideas, which stays clear of the 6
+    existing Popular Idea chip categories — the default "general" mode
+    (Idea Inspiration panel) is unchanged."""
     try:
         category = _get_business_category(user_id)
-        ideas = _generate_idea_labs_ideas(category)
+        ideas = _generate_surprise_ideas(category) if mode == "surprise" else _generate_idea_labs_ideas(category)
         return {"ideas": ideas}
     except HTTPException:
         raise
